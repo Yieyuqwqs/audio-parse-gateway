@@ -30,12 +30,14 @@ impl MockUpstream {
     }
 
     /// 关掉随机失败（测试用；生产演示保持 3% 才能看到竞速接管）
+    #[cfg(test)]
     pub fn without_failures(mut self) -> Self {
         self.failure_rate_pct = 0;
         self
     }
 
     /// 设成 100 就是「永远失败的上游」，用来测全挂时的错误路径。
+    #[cfg(test)]
     pub fn with_failure_rate(mut self, pct: u64) -> Self {
         self.failure_rate_pct = pct.min(100);
         self

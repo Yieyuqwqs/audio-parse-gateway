@@ -17,7 +17,8 @@
 //! 5. 防缓存击穿：`SingleFlight`（DashMap + `tokio::sync::Mutex`），同一个 key 只有一个请求穿透上游，
 //!    其余请求 await 等待并直接复用结果。
 //! 6. 路由：`GET /api/parse?id=<musicId>[&source=kw][&quality=320k]`、`GET /url/{source}/{musicId}`。
-//!   还有 `GET /metrics`（Prometheus 文本格式）与 `GET /health`。
+//!
+//! 监控与健康检查：`GET /metrics`（Prometheus 文本格式）、`GET /health`。
 //!
 //! 启动：`cargo run --release`（默认监听 0.0.0.0:8080；没配真实上游时自动起两个 mock）
 //! 接真实音源：`UPSTREAM_A_URL=https://node.example.com cargo run --release`，或 `ENABLE_NETEASE=1` 直连网易云；`REDIS_URL` 可选
@@ -311,6 +312,7 @@ impl L2Cache {
     }
 
     /// 显式关闭 L2：测试里不想连 redis 时用，读路径直接当未命中。
+    #[cfg(test)]
     fn disabled() -> Self {
         Self {
             url: String::new(),
@@ -806,6 +808,7 @@ fn validate_music_id(raw: Option<&str>) -> Result<&str, AppError> {
 /// | `UPSTREAM_A_TOKEN` / `UPSTREAM_B_TOKEN` | 节点鉴权：`Authorization: Bearer <token>` |
 /// | `ENABLE_NETEASE=1` | 打开网易云直连适配器（真实音源，源 `wy`） |
 /// | `NETEASE_COOKIE` | 网易云登录 cookie，带上才能解锁 320k / flac |
+/// | `NETEASE_BASE` | 网易云接口反代地址，默认 `https://music.163.com` |
 ///
 /// 一个真实上游都没配 → 自动起两个进程内 mock，保证 `cargo run` 就能跑通全链路。
 fn build_upstreams() -> Arc<Vec<Arc<dyn Upstream>>> {
@@ -838,9 +841,13 @@ fn build_upstreams() -> Arc<Vec<Arc<dyn Upstream>>> {
         .unwrap_or(false);
     if netease_enabled {
         let cookie = std::env::var("NETEASE_COOKIE").ok();
-        upstreams.push(Arc::new(
-            NeteaseUpstream::new(UPSTREAM_TIMEOUT).with_cookie(cookie),
-        ));
+        let mut netease = NeteaseUpstream::new(UPSTREAM_TIMEOUT).with_cookie(cookie);
+        if let Ok(base) = std::env::var("NETEASE_BASE") {
+            if !base.trim().is_empty() {
+                netease = netease.with_base(base);
+            }
+        }
+        upstreams.push(Arc::new(netease));
         info!("网易云直连适配器已注册（源 wy）");
     }
 
@@ -996,7 +1003,7 @@ mod tests {
         }
 
         fn supports(&self, source: &str) -> bool {
-            self.only.map_or(true, |only| only == source)
+            self.only.is_none_or(|only| only == source)
         }
 
         async fn resolve(&self, req: &TrackRequest) -> Result<SourceUrl, UpstreamError> {
@@ -1179,9 +1186,11 @@ mod tests {
         let upstreams: Vec<Arc<dyn Upstream>> = vec![Arc::new(FakeUpstream::new("m"))];
         let state = state_with(upstreams);
         // 必须走 handler（respond）才会累加 requests_total；直接 resolve 只动命中/穿透计数
-        respond(&state, "kw", "metrics-1", "320k")
+        let payload = respond(&state, "kw", "metrics-1", "320k")
             .await
             .expect("先打一发");
+        assert_eq!(payload.0.code, 0);
+        assert!(payload.0.data.url.ends_with(".mp3"));
 
         let response = metrics_handler(State(state)).await.into_response();
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)

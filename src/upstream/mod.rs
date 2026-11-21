@@ -170,7 +170,11 @@ pub async fn race(
             // 赢家：直接返回，JoinSet 被 drop → 其余上游任务立刻 abort
             Ok(Ok(url)) => return Ok(url),
             Ok(Err(err)) => {
-                tracing::warn!(error = %err, "one upstream failed, still waiting for the others");
+                tracing::warn!(
+                    error = %err,
+                    retryable = err.is_retryable(),
+                    "one upstream failed, still waiting for the others"
+                );
                 last_error = Some(err);
             }
             Err(join_error) => {

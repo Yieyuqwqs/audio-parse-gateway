@@ -53,7 +53,7 @@ impl NeteaseUpstream {
         self
     }
 
-    /// 换 base（自建反代 / 测试用）。
+    /// 换 base：自建反代（网络不通 / 想走代理）与测试都用它，对应 `NETEASE_BASE`。
     pub fn with_base(mut self, base: impl Into<String>) -> Self {
         self.base = base.into();
         self

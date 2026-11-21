@@ -131,6 +131,7 @@ pub trait Upstream: Send + Sync + fmt::Debug {
 | `UPSTREAM_A_TOKEN` / `UPSTREAM_B_TOKEN` | 节点鉴权：`Authorization: Bearer <token>` |
 | `ENABLE_NETEASE=1` | 打开网易云直连适配器 |
 | `NETEASE_COOKIE` | 网易云登录 cookie（解锁高音质） |
+| `NETEASE_BASE` | 网易云接口反代地址，默认 `https://music.163.com` |
 
 ```bash
 # 接自建节点 + 网易云直连
