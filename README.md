@@ -187,6 +187,15 @@ cargo run --release
 所以想让 LX 真的放无损，只有两条路：给节点/网易云配**有会员的 cookie**（`NETEASE_COOKIE` / `UPSTREAM_A_COOKIE`），
 或让自建节点自己解决签名。带上 cookie 后 `NeteaseUpstream::max_quality()` 会自动升到 `flac24bit`。
 
+验证手上的 cookie 到底能不能拿无损（`url` 给了 `.flac` 才算真的行）：
+
+```bash
+curl -s "https://music.163.com/api/song/enhance/player/url?ids=%5B1330348068%5D&br=999000" \
+  -H "Cookie: MUSIC_U=你的cookie" \
+  -H "Referer: https://music.163.com/"
+# 看 data[0].level：lossless / hires 才是无损，exhigh 说明只是 320k
+```
+
 降档次数进指标 `lx_gateway_quality_downgrades_total`；如果它一直涨、播放器又显示无损，
 说明客户端把「请求档位」当成了实际档位 —— 那是播放器侧的问题，网关这边的语义是准的。
 
