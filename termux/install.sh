@@ -44,6 +44,14 @@ if [ -f "${SELF_DIR}/env" ]; then
   cp "${SELF_DIR}/env" "${APP_DIR}/.env"
   chmod 600 "${APP_DIR}/.env"
   say "已写入 .env（qq/netease 凭据）"
+  # 如果安装包是从共享存储（/sdcard）拷来的，装完立刻把凭据副本删掉，
+  # 免得别的 App 也能读到 cookie
+  case "${SELF_DIR}" in
+    /sdcard/*|/storage/emulated/0/*)
+      rm -f "${SELF_DIR}/env"
+      say "已删除共享存储里的凭据副本（${SELF_DIR}/env）"
+      ;;
+  esac
 fi
 
 # 启动脚本
@@ -82,12 +90,17 @@ BOOTEOF
   say "已安装开机自启脚本：${BOOT_DIR}/start-audio-gateway"
 fi
 
-say "验证二进制能不能跑（--version 不支持时会直接进监听，超时即视为正常）"
-if timeout 3 "$BIN" --help >/dev/null 2>&1 || [ $? -eq 124 ]; then
-  say "二进制可执行 ✅"
+# 验证：启动 2 秒后被 timeout 杀掉 = 二进制能跑（它不支持 --version，启动即进监听）
+say "验证二进制能不能跑…"
+set +e
+timeout 2 "$BIN" > "${APP_DIR}/boot.log" 2>&1
+rc=$?
+set -e
+if [ "$rc" -eq 124 ]; then
+  say "二进制可执行 ✅（跑满 2 秒，被 timeout 正常结束）"
 else
-  say "二进制启动时报错，下面是前 5 行输出："
-  timeout 3 "$BIN" 2>&1 | head -5 || true
+  say "二进制启动异常（exit=${rc}），输出如下："
+  head -10 "${APP_DIR}/boot.log" || true
 fi
 
 cat <<EOF
