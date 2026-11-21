@@ -1,0 +1,7 @@
+target/
+.git/
+.gitignore
+.tmp/
+bench/
+*.md
+!README.md

@@ -14,6 +14,16 @@ UPSTREAM_A_URL=https://node-a.example.com UPSTREAM_B_URL=https://node-b.example.
 
 默认会在 `127.0.0.1` 上自动拉起两个 mock 上游（随机端口），所以**不配任何环境变量也能直接跑通全链路**。
 
+## 代码结构
+
+| 文件 | 职责 |
+| --- | --- |
+| `src/main.rs` | 路由、参数校验、`AppState::resolve` 主链路、适配器装配、启动与优雅退出 |
+| `src/cache.rs` | L1（moka 无锁内存）、L2（Redis ConnectionManager + 熔断降级）、singleflight 门闩 |
+| `src/metrics.rs` | Atomic 指标 + Prometheus 文本输出 |
+| `src/http.rs` | 全局连接池（进程内唯一 reqwest Client） |
+| `src/upstream/` | 适配层：`Upstream` trait + 节点 / 网易云 / mock 三个实现 |
+
 ## 打几发
 
 ```bash
@@ -159,6 +169,28 @@ cargo test
 竞速取最快 / 失败切换 / 全挂 502、singleflight 合并（6 并发只打 1 次上游）、L1 命中、过期直链不返回、
 过载 503、Prometheus 文本、参数校验，以及 **Redis L2 命中**（只认 `REDIS_URL`，本地没起 redis 就自动跳过）。
 CI 里 `cargo build --release`、`cargo test`、`cargo clippy` 都会跑，并且带一个 `redis:7-alpine` service 给 L2 用例用。
+
+## 部署
+
+```bash
+# 最省事：网关 + redis 一起起（没配真实音源时会用两个进程内 mock，适合冒烟）
+docker compose up --build
+
+# 或者只跑网关
+docker build -t lx-gateway .
+docker run --rm -p 8080:8080 lx-gateway
+
+# 接真实音源（cookie / token 走环境变量，别写进仓库）
+docker run --rm -p 8080:8080 \
+  -e UPSTREAM_A_URL=https://node-a.example.com \
+  -e UPSTREAM_A_TOKEN=xxxx \
+  -e ENABLE_NETEASE=1 \
+  -e NETEASE_COOKIE=MUSIC_U=... \
+  lx-gateway
+```
+
+镜像是 `rust:1.88-bookworm` 多阶段构建 → `debian:bookworm-slim` 运行时：依赖层单独缓存，改 `src/` 只重编业务代码。
+内置 `HEALTHCHECK` 打 `/health`；`REDIS_URL` 连不上会自动降级成 L1-only，不会拖垮主链路。`compose` 里的 redis 限制 256MB + `allkeys-lru`，只当直链缓存用、不持久化。
 
 ## 压测
 

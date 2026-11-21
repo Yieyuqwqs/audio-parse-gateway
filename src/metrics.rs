@@ -34,7 +34,7 @@ pub(crate) struct Stats {
 }
 
 impl Stats {
-    pub(crate) fn snapshot(&self) -> StatsSnapshot {
+    fn snapshot(&self) -> StatsSnapshot {
         StatsSnapshot {
             total_requests: self.total.load(Ordering::Relaxed),
             l1_hits: self.l1_hits.load(Ordering::Relaxed),

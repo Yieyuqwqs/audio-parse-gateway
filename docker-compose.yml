@@ -1,0 +1,37 @@
+# docker compose up --build
+#
+# 想在容器里接真实音源，把下面 upstream / netease 的注释打开（cookie 走宿主机环境变量，别写进仓库）
+services:
+  gateway:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      BIND_ADDR: 0.0.0.0:8080
+      REDIS_URL: redis://redis:6379/
+      RUST_LOG: info,audio_parse_gateway=debug
+      # UPSTREAM_A_URL: https://node-a.example.com
+      # UPSTREAM_A_TOKEN: ${UPSTREAM_A_TOKEN:-}
+      # ENABLE_NETEASE: "1"
+      # NETEASE_COOKIE: ${NETEASE_COOKIE:-}
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    # 只做直链缓存，不持久化；内存封顶 + LRU，防止把机器吃穿
+    command: ["redis-server", "--appendonly", "no", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
