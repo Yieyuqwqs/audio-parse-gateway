@@ -14,7 +14,6 @@
 //! * 2xx 绿色（`\x1b[32m`），4xx/5xx 红色（`\x1b[31m`）。
 
 use std::fmt;
-use std::fmt::Write as _;
 
 use chrono::Local;
 use tracing::{
@@ -210,8 +209,7 @@ mod tests {
         assert_eq!(color_for(Some(300)), RED);
         assert_eq!(color_for(None), DIM);
 
-        let mut fields = AccessFields::default();
-        fields.status = Some(200);
+        let fields = AccessFields { status: Some(200), ..Default::default() };
         assert_eq!(fields.status, Some(200));
     }
 }

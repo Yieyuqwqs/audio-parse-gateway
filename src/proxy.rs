@@ -77,6 +77,7 @@ impl ProxyStore {
             .map(|target| (target.url.clone(), target.referer.clone()))
     }
 
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.targets.len()
     }

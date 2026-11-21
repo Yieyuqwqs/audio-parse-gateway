@@ -487,7 +487,13 @@ impl AppState {
             let err = last_error.unwrap_or(UpstreamError::NoCandidate {
                 source_key: source.to_string(),
             });
-            warn!(source, id = music_id, error = %err, "all upstreams failed after the quality chain");
+            warn!(
+                upstream = err.upstream(),
+                source,
+                id = music_id,
+                error = %err,
+                "all upstreams failed after the quality chain"
+            );
             return Err(AppError::from(err));
         };
 
