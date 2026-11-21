@@ -219,7 +219,7 @@ mod tests {
         let node = NodeUpstream::for_test("/api/url");
         let (url, use_query) = node.endpoint(&req());
         assert_eq!(url, "https://node.example.com/api/url");
-        assert!(use_query, "没有 {placeholders} 时必须走查询参数");
+        assert!(use_query, "没有路径模板时必须走查询参数");
     }
 
     #[test]

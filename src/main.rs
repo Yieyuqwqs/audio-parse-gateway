@@ -485,6 +485,7 @@ struct AppState {
 }
 
 /// 一次解析的结果 + 命中信息
+#[derive(Debug)]
 struct Resolved {
     url: SourceUrl,
     /// l1 / l2 / upstream
