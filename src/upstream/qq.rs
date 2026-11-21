@@ -44,6 +44,8 @@ pub struct QqUpstream {
     cookie: Option<String>,
     uin: Option<String>,
     guid: String,
+    /// vkey 入口；测试里可以指到本地回声服务
+    endpoint: String,
     timeout: Duration,
 }
 
@@ -55,6 +57,7 @@ impl QqUpstream {
             uin: None,
             // 设备标识，QQ 只用来区分 vkey 会话，固定值即可
             guid: "10000".to_string(),
+            endpoint: ENDPOINT.to_string(),
             timeout,
         }
     }
@@ -100,6 +103,30 @@ impl QqUpstream {
     fn credentials_complete(&self) -> bool {
         self.cookie.is_some() && self.uin.is_some()
     }
+
+    /// 换 vkey 入口（测试用：指到本地回声服务）
+    #[cfg(test)]
+    pub fn with_base(mut self, endpoint: impl Into<String>) -> Self {
+        self.endpoint = endpoint.into();
+        self
+    }
+
+    /// 请求体里的 uin 必须是 `o0<QQ号>` 形式。
+    ///
+    /// 这条是踩出来的：纯数字 uin 会被接口当游客，320k / 无损一律 101404。
+    fn wire_uin(&self) -> String {
+        match self.uin.as_deref() {
+            Some(uin) => {
+                let digits = uin.trim().trim_start_matches("o0");
+                if digits.is_empty() {
+                    "0".to_string()
+                } else {
+                    format!("o0{digits}")
+                }
+            }
+            None => "0".to_string(),
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -139,7 +166,7 @@ impl Upstream for QqUpstream {
             });
         }
 
-        let uin = self.uin.clone().unwrap_or_else(|| "0".to_string());
+        let uin = self.wire_uin();
         let filenames: Vec<&str> = candidates.iter().map(|(_, filename)| filename.as_str()).collect();
         let payload = serde_json::json!({
             "req_0": {
@@ -161,7 +188,7 @@ impl Upstream for QqUpstream {
 
         let attempt = async {
             let mut builder = crate::http::client()
-                .post(ENDPOINT)
+                .post(self.endpoint.as_str())
                 .header(reqwest::header::REFERER, "https://y.qq.com/")
                 .header(reqwest::header::ORIGIN, "https://y.qq.com")
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -437,5 +464,81 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, UpstreamError::NoUrl { .. }));
+    }
+
+    #[test]
+    fn formats_uin_as_o0_prefix() {
+        let with_digits = QqUpstream::new(Duration::from_millis(800))
+            .with_credentials(Some("qm_keyst=x".to_string()), Some("2310476390".to_string()));
+        assert_eq!(with_digits.wire_uin(), "o02310476390");
+
+        let with_prefix = QqUpstream::new(Duration::from_millis(800))
+            .with_credentials(Some("qm_keyst=x".to_string()), Some("o02310476390".to_string()));
+        assert_eq!(with_prefix.wire_uin(), "o02310476390", "o0 前缀不能重复叠加");
+
+        let guest = QqUpstream::new(Duration::from_millis(800));
+        assert_eq!(guest.wire_uin(), "0", "没有 uin 就是游客");
+    }
+
+    /// 真发一次请求，验证 body 里的 uin 是 o0 形式、cookie 带上了 qm_keyst
+    #[tokio::test]
+    async fn sends_o0_uin_and_cookie_to_the_service() {
+        use axum::{extract::Request, http::StatusCode, response::IntoResponse, routing::post, Json, Router};
+
+        async fn vkey_handler(request: Request) -> axum::response::Response {
+            let cookie = request
+                .headers()
+                .get(reqwest::header::COOKIE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            let body = axum::body::to_bytes(request.into_body(), 64 * 1024)
+                .await
+                .unwrap_or_default();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+            let uin = json["req_0"]["param"]["uin"].as_str().unwrap_or_default().to_string();
+            let platform = json["req_0"]["param"]["platform"].as_str().unwrap_or_default().to_string();
+            let filenames = json["req_0"]["param"]["filename"].to_string();
+
+            if uin != "o02310476390" || !cookie.contains("qm_keyst=") || platform != "20" {
+                return (StatusCode::BAD_REQUEST, format!("bad uin/cookie: {uin} {cookie}")).into_response();
+            }
+            if !filenames.contains("M800") {
+                return (StatusCode::BAD_REQUEST, "320k 文件名没带上".to_string()).into_response();
+            }
+
+            Json(serde_json::json!({
+                "req_0": { "code": 0, "data": {
+                    "sip": ["http://aqqmusic.tc.qq.com/"],
+                    "midurlinfo": [{
+                        "filename": "M800002lzYCa14usQ5.mp3",
+                        "result": 0,
+                        "purl": "M800x.mp3?vkey=OK"
+                    }]
+                }}
+            }))
+            .into_response()
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let app = Router::new().route("/cgi-bin/musicu.fcg", post(vkey_handler));
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let qq = QqUpstream::new(Duration::from_millis(800))
+            .with_credentials(
+                Some("qm_keyst=abc; uin=o02310476390".to_string()),
+                Some("2310476390".to_string()),
+            )
+            .with_base(format!("http://{addr}/cgi-bin/musicu.fcg"));
+
+        let parsed = qq
+            .resolve(&TrackRequest::new("tx", "002lzYCa14usQ5", "320k"))
+            .await
+            .expect("uin 是 o0 形式 + cookie 带上了才会成功");
+        assert_eq!(parsed.quality, "320k");
+        assert_eq!(parsed.url, "http://aqqmusic.tc.qq.com/M800x.mp3?vkey=OK");
     }
 }
