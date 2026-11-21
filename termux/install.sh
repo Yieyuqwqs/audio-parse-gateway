@@ -18,7 +18,9 @@ die() { printf '\033[31m[error]\033[0m %s\n' "$*" >&2; exit 1; }
 say "创建目录 ${APP_DIR}"
 mkdir -p "$APP_DIR"
 
-if [ -x "${SELF_DIR}/audio-parse-gateway" ]; then
+# 注意：共享存储（/sdcard）是 FUSE 挂载，exec 位不一定带得过来，
+# 所以这里只判「文件存在」，拷到 Termux home 之后再 chmod +x
+if [ -f "${SELF_DIR}/audio-parse-gateway" ]; then
   say "使用安装包自带的二进制"
   cp "${SELF_DIR}/audio-parse-gateway" "$BIN"
 else
