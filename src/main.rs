@@ -51,7 +51,9 @@ mod metrics;
 mod quality;
 mod upstream;
 
-use upstream::{MockUpstream, NeteaseUpstream, NodeUpstream, TrackRequest, Upstream, UpstreamError};
+use upstream::{
+    MockUpstream, NeteaseUpstream, NodeUpstream, QqUpstream, TrackRequest, Upstream, UpstreamError,
+};
 
 pub(crate) use cache::{L2Cache, SingleFlight, L1_CACHE};
 pub(crate) use quality::normalize as normalize_quality;
@@ -557,6 +559,9 @@ fn validate_music_id(raw: Option<&str>) -> Result<&str, AppError> {
 /// | `ENABLE_NETEASE=1` | 打开网易云直连适配器（真实音源，源 `wy`） |
 /// | `NETEASE_COOKIE` | 网易云登录 cookie，带上才能解锁 320k / flac |
 /// | `NETEASE_BASE` | 网易云接口反代地址，默认 `https://music.163.com` |
+/// | `ENABLE_QQ=1` 或直接给 `TX_COOKIE` | 打开 QQ 音乐直连适配器（源 `tx`） |
+/// | `TX_COOKIE` | QQ 音乐整段 cookie（`qm_keyst=...; uin=o0<QQ号>`），没登录只有 128k |
+/// | `TX_UIN` | QQ 号（登录态必须，缺了会被当游客） |
 ///
 /// 一个真实上游都没配 → 自动起两个进程内 mock，保证 `cargo run` 就能跑通全链路。
 fn build_upstreams() -> Arc<Vec<Arc<dyn Upstream>>> {
@@ -600,6 +605,21 @@ fn build_upstreams() -> Arc<Vec<Arc<dyn Upstream>>> {
         }
         upstreams.push(Arc::new(netease));
         info!("网易云直连适配器已注册（源 wy）");
+    }
+
+    let qq_enabled = std::env::var("ENABLE_QQ")
+        .map(|value| !value.is_empty() && value != "0")
+        .unwrap_or(false)
+        || std::env::var("TX_COOKIE")
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false);
+    if qq_enabled {
+        let cookie = std::env::var("TX_COOKIE").ok();
+        let uin = std::env::var("TX_UIN").ok();
+        upstreams.push(Arc::new(
+            QqUpstream::new(UPSTREAM_TIMEOUT).with_credentials(cookie, uin),
+        ));
+        info!("QQ 音乐直连适配器已注册（源 tx）");
     }
 
     if upstreams.is_empty() {

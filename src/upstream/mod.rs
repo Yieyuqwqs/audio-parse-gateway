@@ -18,10 +18,12 @@ use crate::SourceUrl;
 pub mod mock;
 pub mod netease;
 pub mod node;
+pub mod qq;
 
 pub use mock::MockUpstream;
 pub use netease::NeteaseUpstream;
 pub use node::NodeUpstream;
+pub use qq::QqUpstream;
 
 /// 一次解析请求。
 ///

@@ -5,3 +5,5 @@ target/
 bench/
 *.md
 !README.md
+.env
+.env.*

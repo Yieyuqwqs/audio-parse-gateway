@@ -14,6 +14,10 @@ services:
       # UPSTREAM_A_TOKEN: ${UPSTREAM_A_TOKEN:-}
       # ENABLE_NETEASE: "1"
       # NETEASE_COOKIE: ${NETEASE_COOKIE:-}
+      # QQ 音乐：compose 会自动读同目录 .env 里的 TX_UIN / TX_COOKIE
+      ENABLE_QQ: ${ENABLE_QQ:-0}
+      TX_UIN: ${TX_UIN:-}
+      TX_COOKIE: ${TX_COOKIE:-}
     depends_on:
       redis:
         condition: service_healthy

@@ -23,7 +23,7 @@ UPSTREAM_A_URL=https://node-a.example.com UPSTREAM_B_URL=https://node-b.example.
 | `src/metrics.rs` | Atomic 指标 + Prometheus 文本输出 |
 | `src/quality.rs` | 音质阶梯：档位排序、降档、能力判定、`br`→档位映射 |
 | `src/http.rs` | 全局连接池（进程内唯一 reqwest Client） |
-| `src/upstream/` | 适配层：`Upstream` trait + 节点 / 网易云 / mock 三个实现 |
+| `src/upstream/` | 适配层：`Upstream` trait + 节点 / 网易云 / QQ / mock 四个实现 |
 
 ## 打几发
 
@@ -133,6 +133,7 @@ pub trait Upstream: Send + Sync + fmt::Debug {
 | --- | --- | --- |
 | `NodeUpstream` | `src/upstream/node.rs` | 通用 HTTP 解析节点：路径支持 `{source}` `{id}` `{quality}` 模板，可带 Bearer token；响应兼容 `{url}` / `{code:0,data:{url}}` / `{data:{url}}` / `{data:[{url}]}`，有效期字段 `expires_at` / `expi` / `expires` 都认 |
 | `NeteaseUpstream` | `src/upstream/netease.rs` | 网易云官方接口直连（源 `wy`）：音质 → 码率（128k/320k/flac），`expi` 写进 `expires_at`；付费/版权下架时接口返回 `url: null`，这里抛 `NoUrl` 让竞速换路，绝不把死链返回给播放器；带 `NETEASE_COOKIE` 才能拿 320k / flac |
+| `QqUpstream` | `src/upstream/qq.rs` | QQ 音乐直连（源 `tx`）：`vkey.GetVkeyServer/CgiGetVkey`，一次请求带多个文件名取最好一档；`qm_keyst` + `o0<uin>` 才算登录 |
 | `MockUpstream` | `src/upstream/mock.rs` | 进程内假上游：0~120ms 抖动 + 3% 失败率，本地就能验证竞速与失败切换；测试里可以关掉 |
 
 装配只看环境变量（`build_upstreams()`）：
@@ -146,6 +147,9 @@ pub trait Upstream: Send + Sync + fmt::Debug {
 | `ENABLE_NETEASE=1` | 打开网易云直连适配器 |
 | `NETEASE_COOKIE` | 网易云登录 cookie：**只有带上它才可能拿到 flac / flac24bit**，否则最高 320k |
 | `NETEASE_BASE` | 网易云接口反代地址，默认 `https://music.163.com` |
+| `ENABLE_QQ=1` 或给 `TX_COOKIE` | 打开 QQ 音乐直连适配器（源 `tx`） |
+| `TX_COOKIE` | QQ 整段 cookie（`qm_keyst=...; uin=o0<QQ号>`），没有就只有 128k |
+| `TX_UIN` | QQ 号 —— 注意请求里要 `o0<QQ号>` 形式，适配器会自动补 |
 
 ```bash
 # 接自建节点 + 网易云直连
@@ -196,6 +200,30 @@ curl -s "https://music.163.com/api/song/enhance/player/url?ids=%5B1330348068%5D&
 # 看 data[0].level：lossless / hires 才是无损，exhigh 说明只是 320k
 ```
 
+### QQ 音乐（`tx`）实测
+
+同一个 vkey 接口一次请求可以带**多个文件名**，网关就按「请求档位 → 128k」全带上，取能拿到的最好一档：
+
+| 文件 | 游客 | 绿钻 | 豪华绿钻 |
+| --- | --- | --- | --- |
+| `M500….mp3`（128k） | ✅ 免费曲 | ✅ | ✅ |
+| `M800….mp3`（320k） | ❌ `101404` | ✅ | ✅ |
+| `F000….flac`（无损） | ❌ `101404` | ❌ `101404` | ✅ |
+| `RS01….flac`（Hi-Res） | ❌ `101404` | ❌ `101404` | ✅ |
+
+两个坑（都踩过）：
+
+1. 现在有效的登录 cookie 是 **`qm_keyst`**，老的 `qqmusic_key` 已经不被认；
+2. 请求体里的 `uin` 必须写成 **`o0<QQ号>`**（和 cookie 里一致），写成纯数字会被当游客 ——
+   这一条不对，320k 就会莫名其妙地 `101404`。
+
+```bash
+# .env（compose 会自动读，且已被 .gitignore/.dockerignore 忽略）
+ENABLE_QQ=1
+TX_UIN=2310476390
+TX_COOKIE='qm_keyst=...; uin=o02310476390'
+```
+
 降档次数进指标 `lx_gateway_quality_downgrades_total`；如果它一直涨、播放器又显示无损，
 说明客户端把「请求档位」当成了实际档位 —— 那是播放器侧的问题，网关这边的语义是准的。
 
@@ -205,10 +233,10 @@ curl -s "https://music.163.com/api/song/enhance/player/url?ids=%5B1330348068%5D&
 cargo test
 ```
 
-共 47 个用例，覆盖：适配层错误分类与 HTTP 状态映射（504 / 502 / 503）、节点响应多形状解析、
+共 56 个用例，覆盖：适配层错误分类与 HTTP 状态映射（504 / 502 / 503）、节点响应多形状解析、
 节点请求实发校验（本地回显服务验证 query / Bearer / Cookie 三件套）、网易云音质→码率与空 url 判定、
 竞速取最快 / 失败切换 / 全挂 502、singleflight 合并（6 并发只打 1 次上游）、L1 命中、过期直链不返回、
-过载 503、Prometheus 文本、参数校验、**音质协商与降档**（天花板筛选 / 静默降级如实上报 / 降档指标），以及 **Redis L2 命中**（只认 `REDIS_URL`，本地没起 redis 就自动跳过）。
+过载 503、Prometheus 文本、参数校验、**音质协商与降档**（天花板筛选 / 静默降级如实上报 / 降档指标 / QQ 多档候选取最优），以及 **Redis L2 命中**（只认 `REDIS_URL`，本地没起 redis 就自动跳过）。
 CI 里 `cargo build --release`、`cargo test`、`cargo clippy` 都会跑，并且带一个 `redis:7-alpine` service 给 L2 用例用。
 
 ## 部署
