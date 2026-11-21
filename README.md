@@ -259,10 +259,41 @@ CI 里 `cargo build --release`、`cargo test`、`cargo clippy` 都会跑，并�
 | `x86_64-unknown-linux-gnu` | 主力产物：glibc 动态链接，Ubuntu/Debian 直接跑 |
 | `x86_64-unknown-linux-musl` | 静态链接，拷到任何 Linux 都能跑（alpine 也行） |
 | `aarch64-unknown-linux-gnu` | ARM64 服务器（Graviton / Ampere 之类） |
+| `aarch64-linux-android` | **Termux / Android**（NDK 编译，bionic libc） |
 
 后两个在矩阵里标了 `experimental`：挂了不会挡住 gnu 产物，也不会把 workflow 带红，
 去 run 日志里看缺哪个交叉工具链即可。`ring`（rustls 的加密实现）交叉编译时需要把 `CC` 指对，
 workflow 里已经配了 `musl-gcc` / `aarch64-linux-gnu-gcc`。
+
+## Termux（Android 手机直接跑）
+
+Android 的 libc 是 bionic，**没有 glibc**，所以 linux-gnu 产物在 Termux 里会报
+`CANNOT LINK EXECUTABLE "ld-linux-aarch64.so.1"`。Release 里专门带了一个
+`aarch64-linux-android`（NDK 编译）的产物，就是给 Termux 用的。
+
+```bash
+# 1) 取安装包（手机浏览器下载或 curl 都行）
+curl -LO https://github.com/Yieyuqwqs/audio-parse-gateway/releases/latest/download/audio-parse-gateway-aarch64-linux-android.tar.gz
+tar -xzf audio-parse-gateway-aarch64-linux-android.tar.gz
+cd audio-parse-gateway-aarch64-linux-android
+
+# 2) 一键安装（建目录、放二进制、写 run.sh、可选开机自启）
+bash install.sh
+
+# 3) 启动
+bash ~/audio-parse-gateway/run.sh
+
+# 4) 验证
+curl -s 'http://127.0.0.1:8080/health'
+```
+
+说明：
+
+* 装二进制不需要 root，也不需要 proot；但它依赖 Termux 自己的运行库，
+  所以**只能在 Termux 里跑**（系统 shell 里跑不了）；
+* 默认监听 `127.0.0.1:8080`（只给本机用）；局域网访问改成 `BIND_ADDR=0.0.0.0:8080`；
+* 开机自启：装 `termux-boot` 后 `install.sh` 会写好 `~/.termux/boot/start-audio-gateway`；
+* 凭据放在 `~/audio-parse-gateway/.env`（0600），参考 `termux/env.example`。
 
 ## 部署
 
