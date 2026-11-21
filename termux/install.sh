@@ -2,8 +2,8 @@
 # audio-parse-gateway · Termux 一键安装
 #
 # 用法：在 Termux 里执行
-#   bash "$HOME/install.sh"
-#   或：bash /sdcard/dsh-deploy/install.sh
+#   bash /sdcard/dsh-deploy/audio-parse-gateway-aarch64-linux-android/install.sh
+#   或（从 Release 拉的包）：bash ~/apg/install.sh
 set -euo pipefail
 
 APP_DIR="${HOME}/audio-parse-gateway"
@@ -11,20 +11,19 @@ BIN="${APP_DIR}/audio-parse-gateway"
 SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 say() { printf '\033[36m[termux]\033[0m %s\n' "$*"; }
+warn() { printf '\033[33m[termux]\033[0m %s\n' "$*"; }
 die() { printf '\033[31m[error]\033[0m %s\n' "$*" >&2; exit 1; }
 
-[ -n "${PREFIX:-}" ] || die "请用 Termux 自带的 bash 运行（$PREFIX 未设置）"
+[ -n "${PREFIX:-}" ] || die "请用 Termux 自带的 bash 运行（\$PREFIX 未设置）"
 
 say "创建目录 ${APP_DIR}"
 mkdir -p "$APP_DIR"
 
-# 注意：共享存储（/sdcard）是 FUSE 挂载，exec 位不一定带得过来，
-# 所以这里只判「文件存在」，拷到 Termux home 之后再 chmod +x
+# 共享存储（/sdcard）是 FUSE 挂载，exec 位不一定带得过来，所以只判「文件存在」
 if [ -f "${SELF_DIR}/audio-parse-gateway" ]; then
   say "使用安装包自带的二进制"
   cp "${SELF_DIR}/audio-parse-gateway" "$BIN"
 else
-  # 从 Release 拉 arm64-android 产物（需要 curl；没有就告诉用户装）
   command -v curl >/dev/null 2>&1 || die "缺少 curl：pkg install curl 后再跑"
   VER="${APG_VERSION:-latest}"
   if [ "$VER" = "latest" ]; then
@@ -41,67 +40,87 @@ fi
 chmod +x "$BIN"
 say "二进制：$(ls -lh "$BIN" | awk '{print $5}')"
 
-# 凭据：从之前放置的 env 文件抄过去（只在存在时才拷，避免把空密钥写进去）
+# ---------- 凭据 ----------
 if [ -f "${SELF_DIR}/env" ]; then
   cp "${SELF_DIR}/env" "${APP_DIR}/.env"
   chmod 600 "${APP_DIR}/.env"
-  say "已写入 .env（qq/netease 凭据）"
-  # 如果安装包是从共享存储（/sdcard）拷来的，装完立刻把凭据副本删掉，
-  # 免得别的 App 也能读到 cookie
+  say "已写入 .env（QQ / 网易云凭据）"
   case "${SELF_DIR}" in
     /sdcard/*|/storage/emulated/0/*)
       rm -f "${SELF_DIR}/env"
-      say "已删除共享存储里的凭据副本（${SELF_DIR}/env）"
+      say "已删除共享存储里的凭据副本"
       ;;
   esac
+elif [ -f "${APP_DIR}/.env" ]; then
+  say "沿用已有的 .env"
+else
+  warn "没有 .env：网关只会起两个 mock 上游，返回的直链是假的（播放器会「换源失败」）"
 fi
 
-# 启动脚本
+# .env -> env.sh（值用单引号包起来，cookie 里有空格和分号也不会炸）
+if [ -f "${APP_DIR}/.env" ]; then
+  : > "${APP_DIR}/env.sh"
+  while IFS= read -r line; do
+    case "$line" in ''|'#'*) continue ;; esac
+    case "$line" in *=*) ;; *) continue ;; esac
+    key="${line%%=*}"
+    val="${line#*=}"
+    val=$(printf '%s' "$val" | sed "s/'/'\\\\''/g")
+    printf "export %s='%s'\n" "$key" "$val" >> "${APP_DIR}/env.sh"
+  done < "${APP_DIR}/.env"
+  chmod 600 "${APP_DIR}/env.sh"
+  say "已生成 env.sh（run.sh 会自动 source）"
+fi
+
+# ---------- 启动脚本 ----------
 cat > "${APP_DIR}/run.sh" <<'RUNEOF'
 #!/data/data/com.termux/files/usr/bin/bash
 set -euo pipefail
 cd "$(dirname "$0")"
+
+# 关键：把凭据喂给进程，否则网关会回退到 mock 上游（假直链 -> 播放器「换源失败」）
+if [ -f ./env.sh ]; then
+  . ./env.sh
+fi
+
 export BIND_ADDR="${BIND_ADDR:-127.0.0.1:8080}"
-# 没有 redis 时不设 REDIS_URL，网关启动探测一次就会关掉 L2，请求路径零等待
-# RUST_LOG=info,audio_parse_gateway=debug   # 需要排障时打开
+
+if [ -z "${ENABLE_QQ:-}${ENABLE_NETEASE:-}${UPSTREAM_A_URL:-}" ]; then
+  printf '\033[33m[run]\033[0m 警告：没有检测到真实上游（ENABLE_QQ / ENABLE_NETEASE / UPSTREAM_A_URL 都为空）\n'
+  printf '\033[33m[run]\033[0m       现在只会返回 mock 假直链，播放器一定「换源失败」\n'
+fi
+
+# 没有 redis 就不用设 REDIS_URL：启动探测一次失败后 L2 会永久关闭，请求路径零等待
 exec ./audio-parse-gateway
 RUNEOF
 chmod +x "${APP_DIR}/run.sh"
 
-# dotenv 解析：把 KEY=VALUE 变成 export KEY=VALUE（供 loginctl/termux-services 用）
-if [ -f "${APP_DIR}/.env" ]; then
-  while IFS= read -r line; do
-    case "$line" in ''|'#'*) continue ;; esac
-    case "$line" in *=*) printf 'export %s\n' "${line%%=*}=$(printf '%s' "${line#*=}" | sed "s/^'//;s/'$//")" ;; esac
-  done < "${APP_DIR}/.env" > "${APP_DIR}/env.sh"
-  chmod 600 "${APP_DIR}/env.sh"
-fi
-
-# 开机自启（可选）：有 termux-boot 就装一个开机脚本
-if [ -d "${PREFIX}/etc/termux-boot" ] || command -v termux-boot >/dev/null 2>&1; then
+# ---------- 开机自启（可选） ----------
+if [ -d "${PREFIX}/etc" ]; then
   BOOT_DIR="${HOME}/.termux/boot"
   mkdir -p "$BOOT_DIR"
   cat > "${BOOT_DIR}/start-audio-gateway" <<'BOOTEOF'
 #!/data/data/com.termux/files/usr/bin/sh
 termux-wake-lock
-cd "$HOME/audio-parse-gateway"
+cd "$HOME/audio-parse-gateway" || exit 1
 if [ -f ./env.sh ]; then . ./env.sh; fi
+export BIND_ADDR="${BIND_ADDR:-127.0.0.1:8080}"
 nohup ./audio-parse-gateway >> ./gateway.log 2>&1 &
 BOOTEOF
   chmod +x "${BOOT_DIR}/start-audio-gateway"
-  say "已安装开机自启脚本：${BOOT_DIR}/start-audio-gateway"
+  say "已安装开机自启脚本（需要 termux-boot 才生效）：${BOOT_DIR}/start-audio-gateway"
 fi
 
-# 验证：启动 2 秒后被 timeout 杀掉 = 二进制能跑（它不支持 --version，启动即进监听）
+# ---------- 自检：启动 2 秒后被杀 = 能跑 ----------
 say "验证二进制能不能跑…"
 set +e
 timeout 2 "$BIN" > "${APP_DIR}/boot.log" 2>&1
 rc=$?
 set -e
 if [ "$rc" -eq 124 ]; then
-  say "二进制可执行 ✅（跑满 2 秒，被 timeout 正常结束）"
+  say "二进制可执行 ✅（跑满 2 秒被 timeout 正常结束）"
 else
-  say "二进制启动异常（exit=${rc}），输出如下："
+  warn "二进制启动异常（exit=${rc}），前 10 行输出："
   head -10 "${APP_DIR}/boot.log" || true
 fi
 
@@ -112,7 +131,7 @@ cat <<EOF
  启动： bash ${APP_DIR}/run.sh
  测试： curl 'http://127.0.0.1:8080/health'
         curl 'http://127.0.0.1:8080/api/parse?id=002lzYCa14usQ5&source=tx&quality=320k'
- 日志： 只有一行访问日志（08:53:38 | [200] ...）
- 停止：  Ctrl+C 或 pkill -f audio-parse-gateway
+ 日志： 每请求一行（08:53:38 | [200] tx ... | 780ms）
+ 停止： Ctrl+C 或 pkill -f audio-parse-gateway
 ========================================
 EOF

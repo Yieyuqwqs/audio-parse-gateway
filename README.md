@@ -59,6 +59,8 @@ curl 'http://127.0.0.1:8080/metrics'
 
 把下面脚本导入 LX Music 的「自定义源」（设置 → 自定义源 → 导入）：
 
+> 现成的、带 mock 检测与跨平台回退的脚本：`examples/lx-source.js`（导入 LX Music 的自定义源即可）。
+
 ```js
 /**
  * @name 自建 Rust 解析源
@@ -294,6 +296,40 @@ curl -s 'http://127.0.0.1:8080/health'
 * 默认监听 `127.0.0.1:8080`（只给本机用）；局域网访问改成 `BIND_ADDR=0.0.0.0:8080`；
 * 开机自启：装 `termux-boot` 后 `install.sh` 会写好 `~/.termux/boot/start-audio-gateway`；
 * 凭据放在 `~/audio-parse-gateway/.env`（0600），参考 `termux/env.example`。
+
+### 排障：LX 显示「换源失败」
+
+九成是**网关没有真实上游**，返回了 mock 假直链。先看启动日志有没有这一行：
+
+```text
+WARN 未配置真实上游，回退到两个进程内 mock（配 UPSTREAM_A_URL 或 ENABLE_NETEASE=1 即可接真实音源）
+```
+
+有的话，按顺序查：
+
+1. **凭据没被加载**：`run.sh` 必须 source `env.sh`（`install.sh` 会生成它）。
+   `~/audio-parse-gateway/.env` 存在 ≠ 进程读到了，直接确认：
+   ```bash
+   bash -c '. ~/audio-parse-gateway/env.sh; echo "$ENABLE_QQ / $TX_UIN / ${TX_COOKIE:0:12}…"'
+   ```
+2. **只有 mock 上游**：`curl -s http://127.0.0.1:8080/health | grep -o '"ok":true'`，
+   再确认 `platforms.tx.adapters` 里是不是只有 `upstream-a/upstream-b`。
+3. **该平台本来就没适配器**：kg / kw / mg 目前是空的（`ok:false`），LX 里换到这些源必然失败，
+   需要给它们配节点（`UPSTREAM_A_URL` + `UPSTREAM_A_COOKIE`）。
+4. **直链 403 放不出来**：QQ 直链默认走网关代拉（`AUTO_PROXY=tx`），`/stream/{token}` 会补 `Referer`；
+   如果手动关过 `AUTO_PROXY`，客户端裸拉就容易 403。
+5. **VIP 歌 320k/无损拿不到**：QQ 要先看账号权益（绿钻 320k、豪华绿钻 flac），
+   网易云要 `NETEASE_COOKIE`；拿不到时网关会降档返回 320k（`downgraded=true`），而不是报错。
+
+自检脚本（Termux 里直接跑）：
+
+```bash
+curl -s http://127.0.0.1:8080/health
+curl -s 'http://127.0.0.1:8080/api/parse?id=002lzYCa14usQ5&source=tx&quality=320k'
+```
+
+* `health` 里 `platforms.tx.adapters` 应该有 `qq`；
+* `api/parse` 返回的 `data.url` **不能**是 `*.lx-mock.example`，`data.provider` 应该是 `qq` / `netease` 这种真名字。
 
 ## 部署
 
