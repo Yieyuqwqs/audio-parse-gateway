@@ -76,14 +76,23 @@ impl QqUpstream {
     }
 
     /// 从请求档位往下的所有候选文件名（好 → 差），一次请求全带上。
+    ///
+    /// 用阶梯下标往回走，而不是拿着调用方传进来的 `&str` 游标 ——
+    /// 后者活不过这次调用，返回 `Vec<(&'static str, String)>` 会报生命周期错误。
     fn candidates(quality: &str, mid: &str) -> Vec<(&'static str, String)> {
         let mut out = Vec::new();
-        let mut cursor = Some(quality);
-        while let Some(current) = cursor {
-            if let Some(filename) = Self::filename_for(current, mid) {
-                out.push((current, filename));
+        let Some(mut index) = crate::quality::rank(quality) else {
+            return out;
+        };
+        loop {
+            let candidate = crate::quality::LADDER[index];
+            if let Some(filename) = Self::filename_for(candidate, mid) {
+                out.push((candidate, filename));
             }
-            cursor = crate::quality::downgrade(current);
+            if index == 0 {
+                break;
+            }
+            index -= 1;
         }
         out
     }
