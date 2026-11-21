@@ -19,6 +19,10 @@ pub mod mock;
 pub mod netease;
 pub mod node;
 
+pub use mock::MockUpstream;
+pub use netease::NeteaseUpstream;
+pub use node::NodeUpstream;
+
 /// 一次解析请求。
 ///
 /// `music_id` 用 owned `String` 是为了让请求能被 `tokio::spawn` 搬进独立 task
@@ -70,10 +74,14 @@ pub enum UpstreamError {
     Decode { upstream: String, detail: String },
     #[error("upstream `{upstream}` has no playable url: {detail}")]
     NoUrl { upstream: String, detail: String },
-    #[error("upstream `{upstream}` does not support source `{source}`")]
-    Unsupported { upstream: String, source: String },
-    #[error("no registered upstream supports source `{source}`")]
-    NoCandidate { source: String },
+    #[error("upstream `{upstream}` does not support source `{source_key}`")]
+    Unsupported {
+        upstream: String,
+        /// 注意：字段不能叫 `source`，thiserror 会把它当成 error source（要求实现 StdError）
+        source_key: String,
+    },
+    #[error("no registered upstream supports source `{source_key}`")]
+    NoCandidate { source_key: String },
 }
 
 impl UpstreamError {
@@ -129,7 +137,7 @@ pub async fn race(
         .filter(|upstream| upstream.supports(req.source))
         .collect();
     if candidates.is_empty() {
-        return Err(UpstreamError::NoCandidate { source: req.source.to_string() });
+        return Err(UpstreamError::NoCandidate { source_key: req.source.to_string() });
     }
 
     let mut tasks = tokio::task::JoinSet::new();

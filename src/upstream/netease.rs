@@ -88,7 +88,7 @@ impl Upstream for NeteaseUpstream {
     async fn resolve(&self, req: &TrackRequest) -> Result<SourceUrl, UpstreamError> {
         let bitrate = Self::bitrate_for(req.quality).ok_or_else(|| UpstreamError::Unsupported {
             upstream: self.name.clone(),
-            source: format!("{}@{}", req.source, req.quality),
+            source_key: format!("{}@{}", req.source, req.quality),
         })?;
 
         // 网易云的 id 必须是纯数字；不是就说明调用方传错了（比如把 kw 的 rid 丢给 wy）
