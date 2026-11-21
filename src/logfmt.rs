@@ -112,7 +112,7 @@ pub(crate) fn render_line(
     let color = color_for(status);
     let code = status.map(|value| value.to_string()).unwrap_or_else(|| "-".to_string());
     format!(
-        "{time} | {color}[{code:>3}]{RESET} {source:<2} {id:<22} {quality:<10} | {elapsed_ms}ms"
+        "{time} | {color}[{code:>3}]{RESET} {source:<2} {id:<22}{quality:<10}| {elapsed_ms}ms"
     )
 }
 
