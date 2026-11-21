@@ -806,6 +806,7 @@ fn validate_music_id(raw: Option<&str>) -> Result<&str, AppError> {
 /// | `UPSTREAM_A_URL` / `UPSTREAM_B_URL` | 解析节点地址（不配就跳过这一路） |
 /// | `UPSTREAM_A_PATH` / `UPSTREAM_B_PATH` | 节点路径，默认 `/api/url`，支持 `{source}` `{id}` `{quality}` 模板 |
 /// | `UPSTREAM_A_TOKEN` / `UPSTREAM_B_TOKEN` | 节点鉴权：`Authorization: Bearer <token>` |
+/// | `UPSTREAM_A_COOKIE` / `UPSTREAM_B_COOKIE` | 节点会话 cookie（很多平台的解析节点靠它鉴权） |
 /// | `ENABLE_NETEASE=1` | 打开网易云直连适配器（真实音源，源 `wy`） |
 /// | `NETEASE_COOKIE` | 网易云登录 cookie，带上才能解锁 320k / flac |
 /// | `NETEASE_BASE` | 网易云接口反代地址，默认 `https://music.163.com` |
@@ -814,9 +815,9 @@ fn validate_music_id(raw: Option<&str>) -> Result<&str, AppError> {
 fn build_upstreams() -> Arc<Vec<Arc<dyn Upstream>>> {
     let mut upstreams: Vec<Arc<dyn Upstream>> = Vec::new();
 
-    for (url_var, path_var, token_var, name) in [
-        ("UPSTREAM_A_URL", "UPSTREAM_A_PATH", "UPSTREAM_A_TOKEN", "node-a"),
-        ("UPSTREAM_B_URL", "UPSTREAM_B_PATH", "UPSTREAM_B_TOKEN", "node-b"),
+    for (url_var, path_var, token_var, cookie_var, name) in [
+        ("UPSTREAM_A_URL", "UPSTREAM_A_PATH", "UPSTREAM_A_TOKEN", "UPSTREAM_A_COOKIE", "node-a"),
+        ("UPSTREAM_B_URL", "UPSTREAM_B_PATH", "UPSTREAM_B_TOKEN", "UPSTREAM_B_COOKIE", "node-b"),
     ] {
         let Ok(base) = std::env::var(url_var) else { continue };
         if base.trim().is_empty() {
@@ -831,6 +832,9 @@ fn build_upstreams() -> Arc<Vec<Arc<dyn Upstream>>> {
         }
         if let Ok(token) = std::env::var(token_var) {
             node = node.with_token(Some(token));
+        }
+        if let Ok(cookie) = std::env::var(cookie_var) {
+            node = node.with_cookie(Some(cookie));
         }
         info!(upstream = name, "解析节点适配器已注册");
         upstreams.push(Arc::new(node));
@@ -1030,9 +1034,13 @@ mod tests {
     }
 
     fn state_with(upstreams: Vec<Arc<dyn Upstream>>) -> AppState {
+        state_with_l2(upstreams, L2Cache::disabled())
+    }
+
+    fn state_with_l2(upstreams: Vec<Arc<dyn Upstream>>, l2: L2Cache) -> AppState {
         AppState {
             upstreams: Arc::new(upstreams),
-            l2: Arc::new(L2Cache::disabled()),
+            l2: Arc::new(l2),
             flight: Arc::new(SingleFlight::default()),
             limiter: Arc::new(Semaphore::new(64)),
             stats: Arc::new(Stats::default()),
@@ -1221,5 +1229,34 @@ mod tests {
         assert!(validate_music_id(Some("   ")).is_err());
         assert!(validate_music_id(Some("a/b")).is_err(), "路径分隔符必须被拒绝");
         assert!(validate_music_id(Some(&"x".repeat(129))).is_err());
+    }
+
+    /// L2 只在有 Redis 时才跑：CI 用 `services: redis` 提供 `REDIS_URL`，本地没起 redis 就自动跳过。
+    #[tokio::test]
+    async fn l2_cache_is_used_when_redis_is_available() {
+        let Ok(redis_url) = std::env::var("REDIS_URL") else {
+            eprintln!("跳过 L2 用例：未设置 REDIS_URL（本地没起 redis）");
+            return;
+        };
+
+        let upstreams: Vec<Arc<dyn Upstream>> = vec![Arc::new(FakeUpstream::new("l2-a"))];
+        let state = state_with_l2(upstreams, L2Cache::new(redis_url));
+
+        // 手动塞一条「别的实例写好」的 L2 记录，验证多实例共享缓存这条路径
+        let key = "kw:l2-roundtrip-1:320k";
+        let seeded = SourceUrl {
+            url: "https://cdn-l2.example/seeded.mp3".to_string(),
+            provider: "seed".to_string(),
+            quality: "320k".to_string(),
+            expires_at: now_unix() + 600,
+        };
+        state.l2.set(key, &seeded).await;
+
+        let resolved = state
+            .resolve("kw", "l2-roundtrip-1", "320k")
+            .await
+            .expect("L2 命中应该直接返回");
+        assert_eq!(resolved.layer, "l2", "应该是从 Redis 拿到的");
+        assert_eq!(resolved.url.url, "https://cdn-l2.example/seeded.mp3");
     }
 }

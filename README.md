@@ -129,6 +129,7 @@ pub trait Upstream: Send + Sync + fmt::Debug {
 | `UPSTREAM_A_URL` / `UPSTREAM_B_URL` | 解析节点地址（不配就跳过这一路） |
 | `UPSTREAM_A_PATH` / `UPSTREAM_B_PATH` | 节点路径，默认 `/api/url`，支持 `{source}` `{id}` `{quality}` |
 | `UPSTREAM_A_TOKEN` / `UPSTREAM_B_TOKEN` | 节点鉴权：`Authorization: Bearer <token>` |
+| `UPSTREAM_A_COOKIE` / `UPSTREAM_B_COOKIE` | 节点会话 cookie（平台反爬/登录态靠它，逐字透传不改写） |
 | `ENABLE_NETEASE=1` | 打开网易云直连适配器 |
 | `NETEASE_COOKIE` | 网易云登录 cookie（解锁高音质） |
 | `NETEASE_BASE` | 网易云接口反代地址，默认 `https://music.163.com` |
@@ -143,15 +144,34 @@ cargo run --release
 新增一个音源 = 实现 `Upstream` + 在 `build_upstreams()` 里 `push` 一项，
 缓存 / singleflight / 竞速 / 指标这些主链路一行都不用改。
 
+> 平台直连（kw / kg / tx / mg）目前都卡在各家的反爬会话或签名算法上：酷我 web 的 `playUrl`
+> 没有合法 `Hm_Iuvt` 会话就只会回 `The request is illegal!`，旧的 `anti.s` 接口已经退化成返回同一个兜底文件。
+> 所以这类源现阶段走**「节点 + cookie/token」**：节点自己做签名，网关负责缓存、竞速与容错。
+
 ## 测试
 
 ```bash
 cargo test
 ```
 
-覆盖：适配层错误分类与 HTTP 状态映射（504 / 502 / 503）、节点响应多形状解析、网易云音质→码率与空 url 判定、
+共 35 个用例，覆盖：适配层错误分类与 HTTP 状态映射（504 / 502 / 503）、节点响应多形状解析、
+节点请求实发校验（本地回显服务验证 query / Bearer / Cookie 三件套）、网易云音质→码率与空 url 判定、
 竞速取最快 / 失败切换 / 全挂 502、singleflight 合并（6 并发只打 1 次上游）、L1 命中、过期直链不返回、
-过载 503、Prometheus 文本、参数校验。CI 里 `cargo build --release`、`cargo test`、`cargo clippy` 都会跑。
+过载 503、Prometheus 文本、参数校验，以及 **Redis L2 命中**（只认 `REDIS_URL`，本地没起 redis 就自动跳过）。
+CI 里 `cargo build --release`、`cargo test`、`cargo clippy` 都会跑，并且带一个 `redis:7-alpine` service 给 L2 用例用。
+
+## 压测
+
+零依赖脚本（node >= 18）：
+
+```bash
+cargo run --release
+node bench/load.js http://127.0.0.1:8080 64 10        # 每次新 id，全穿透
+node bench/load.js http://127.0.0.1:8080 64 10 hot    # 同一个 id，测缓存与合并
+```
+
+压测时盯 `/metrics` 的 `lx_gateway_inflight_upstream`（≤ 2000）、`lx_gateway_singleflight_keys`（≤ 20000 且压完回 0）、
+`lx_gateway_coalesced_total`（hot 模式应上涨）。细节见 `bench/README.md`。
 
 ## 关键参数（改 main.rs 顶部常量即可）
 

@@ -22,6 +22,7 @@ pub struct NodeUpstream {
     base: String,
     path: String,
     token: Option<String>,
+    cookie: Option<String>,
     timeout: Duration,
 }
 
@@ -33,6 +34,7 @@ impl NodeUpstream {
             base: base.into(),
             path: "/api/url".to_string(),
             token: None,
+            cookie: None,
             timeout,
         }
     }
@@ -46,6 +48,12 @@ impl NodeUpstream {
     /// 节点要求鉴权时带上：`Authorization: Bearer <token>`。
     pub fn with_token(mut self, token: Option<String>) -> Self {
         self.token = token.filter(|value| !value.trim().is_empty());
+        self
+    }
+
+    /// 节点需要会话时带上 `Cookie: <cookie>`（很多平台的解析节点靠它鉴权）。
+    pub fn with_cookie(mut self, cookie: Option<String>) -> Self {
+        self.cookie = cookie.filter(|value| !value.trim().is_empty());
         self
     }
 
@@ -99,6 +107,9 @@ impl Upstream for NodeUpstream {
             }
             if let Some(token) = self.token.as_deref() {
                 builder = builder.bearer_auth(token);
+            }
+            if let Some(cookie) = self.cookie.as_deref() {
+                builder = builder.header(reqwest::header::COOKIE, cookie);
             }
 
             let response = builder.send().await.map_err(|source| UpstreamError::Transport {
@@ -297,5 +308,71 @@ mod tests {
     fn rejects_garbage_body() {
         let err = parse_node_body("n", "<html>502 Bad Gateway</html>").unwrap_err();
         assert!(matches!(err, UpstreamError::Decode { .. }));
+    }
+
+    #[tokio::test]
+    async fn sends_query_params_token_and_cookie_to_the_node() {
+        use axum::{
+            extract::Request,
+            http::StatusCode,
+            response::{IntoResponse, Response},
+            routing::get,
+            Json, Router,
+        };
+
+        /// 回显校验：query / token / cookie 缺一个就 400，让用例失败得明白
+        async fn echo(request: Request) -> Response {
+            let query = request.uri().query().unwrap_or_default().to_string();
+            let header = |name: &str| {
+                request
+                    .headers()
+                    .get(name)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            let token = header("authorization");
+            let cookie = header("cookie");
+
+            if !query.contains("source=kw")
+                || !query.contains("id=123456")
+                || !query.contains("quality=320k")
+            {
+                return (StatusCode::BAD_REQUEST, format!("bad query: {query}")).into_response();
+            }
+            if token != "Bearer secret-token" {
+                return (StatusCode::BAD_REQUEST, format!("bad auth: {token}")).into_response();
+            }
+            if cookie != "kw_token=abc" {
+                return (StatusCode::BAD_REQUEST, format!("bad cookie: {cookie}")).into_response();
+            }
+            Json(serde_json::json!({
+                "url": "https://cdn-echo.example/ok.flac",
+                "expires_at": 42
+            }))
+            .into_response()
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local echo server");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            let app = Router::new().route("/api/url", get(echo));
+            if let Err(err) = axum::serve(listener, app).await {
+                eprintln!("echo server stopped: {err}");
+            }
+        });
+
+        let node = NodeUpstream::new("echo", format!("http://{addr}"), Duration::from_millis(800))
+            .with_token(Some("secret-token".to_string()))
+            .with_cookie(Some("kw_token=abc".to_string()));
+
+        let resolved = node
+            .resolve(&TrackRequest::new("kw", "123456", "320k"))
+            .await
+            .expect("query + header 都对才会成功");
+        assert_eq!(resolved.url, "https://cdn-echo.example/ok.flac");
+        assert_eq!(resolved.expires_at, 42);
     }
 }
