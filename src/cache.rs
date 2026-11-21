@@ -1,17 +1,20 @@
 //! 缓存层：L1（moka 内存）+ L2（Redis）+ singleflight 防击穿。
 
-use std::{sync::Arc, time::Instant};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 use dashmap::DashMap;
 use moka::future::Cache;
 use once_cell::sync::Lazy;
 use redis::AsyncCommands;
 use tokio::sync::Mutex;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use crate::{
-    SourceUrl, L1_CAPACITY, L1_TTL, L2_CONNECT_TIMEOUT, L2_KEY_PREFIX, L2_OP_TIMEOUT, L2_RETRY_BACKOFF,
-    L2_TTL_SECS, MAX_FLIGHT_KEYS,
+    SourceUrl, L1_CAPACITY, L1_TTL, L2_CONNECT_TIMEOUT, L2_KEY_PREFIX, L2_OP_TIMEOUT, L2_TTL_SECS,
+    MAX_FLIGHT_KEYS,
 };
 
 // ---------------------------------------------------------------------------
@@ -30,35 +33,39 @@ pub(crate) static L1_CACHE: Lazy<Cache<String, Arc<SourceUrl>>> = Lazy::new(|| {
 });
 
 // ---------------------------------------------------------------------------
-// 2.2 L2 缓存：redis-rs ConnectionManager（异步连接池 + 自动重连）
+// 2.2 L2 缓存：redis-rs ConnectionManager（启动探测，连不上就永久关掉）
 // ---------------------------------------------------------------------------
 
 struct L2State {
+    /// 首次连接成功后的多路复用句柄（可以 clone 后并发用）
     conn: Option<redis::aio::ConnectionManager>,
-    /// 熔断：在这个时间点之前不再尝试重连
-    next_retry_at: Instant,
 }
 
 /// L2：Redis 共享缓存。
 ///
-/// `ConnectionManager` 内部持有 **一条多路复用的连接**（multiplexed），可以 `clone` 后
-/// 并发使用；断线时它自己在后台重连并把失败的命令重放给新连接。
-/// 这里再包一层「熔断窗口」：Redis 彻底挂掉时每 5s 才尝试一次重连，
-/// 其余请求直接判阴性 → 自动降级为 L1-only，绝不阻塞主链路。
+/// 这里最要紧的不是「怎么连」，而是**没装 Redis 的机器上别拖慢主链路**：
+///
+/// * 启动时 [`L2Cache::probe`] 只试连一次；失败就把 `enabled` 关掉，
+///   之后所有 `get` / `set` 都是纯内存判断，**零等待**；
+/// * 运行期最多连一次（`attempted` 兜底），彻底干掉「每 5 秒重试一次、每次卡 500ms」这种抖法；
+/// * 读写各自有硬超时：L2 只是加速层，永远不允许它决定主链路的延迟。
 pub(crate) struct L2Cache {
     url: String,
+    /// false = 不连 Redis（没配置 / 探测失败 / 测试里显式关闭）
+    enabled: AtomicBool,
+    /// 连接只尝试一次，避免并发请求一起去建连
+    attempted: AtomicBool,
     state: Mutex<L2State>,
-    /// false = 显式关闭（单元测试 / 纯 L1 部署），连 redis 都不尝试
-    enabled: bool,
 }
 
 impl L2Cache {
     pub(crate) fn new(url: String) -> Self {
-        info!(%url, "L2 cache (redis) configured");
+        let configured = !url.trim().is_empty();
         Self {
             url,
-            state: Mutex::new(L2State { conn: None, next_retry_at: Instant::now() }),
-            enabled: true,
+            enabled: AtomicBool::new(configured),
+            attempted: AtomicBool::new(false),
+            state: Mutex::new(L2State { conn: None }),
         }
     }
 
@@ -67,35 +74,58 @@ impl L2Cache {
     pub(crate) fn disabled() -> Self {
         Self {
             url: String::new(),
-            state: Mutex::new(L2State { conn: None, next_retry_at: Instant::now() }),
-            enabled: false,
+            enabled: AtomicBool::new(false),
+            attempted: AtomicBool::new(true),
+            state: Mutex::new(L2State { conn: None }),
         }
     }
 
-    /// 取一个可克隆的连接句柄；拿不到就返回 `None`（= 优雅降级）。
+    /// 当前是否还在用 L2（关掉之后请求路径完全零开销）
+    pub(crate) fn is_enabled(&self) -> bool {
+        self.enabled.load(Ordering::Relaxed)
+    }
+
+    /// 启动时跑一次：连得上就保留 L2，连不上直接全局关闭。
+    pub(crate) async fn probe(&self) -> bool {
+        if !self.is_enabled() {
+            return false;
+        }
+        if self.connection().await.is_some() {
+            info!(url = %self.url, "L2 cache (redis) connected");
+            true
+        } else {
+            warn!("redis unreachable at startup: L2 disabled, running L1-only");
+            false
+        }
+    }
+
+    /// 取连接句柄：**每个进程只试一次**，失败即永久关闭。
     async fn connection(&self) -> Option<redis::aio::ConnectionManager> {
-        if !self.enabled {
+        if !self.is_enabled() {
             return None;
         }
-        let mut state = self.state.lock().await;
-
-        if let Some(conn) = state.conn.as_ref() {
-            return Some(conn.clone());
+        {
+            let state = self.state.lock().await;
+            if let Some(conn) = state.conn.as_ref() {
+                return Some(conn.clone());
+            }
         }
-        if Instant::now() < state.next_retry_at {
-            return None; // 熔断窗口内，直接跳过
+
+        // swap 成功的那一个请求负责建连；其余请求不排队、不等待，直接当未命中
+        if self.attempted.swap(true, Ordering::SeqCst) {
+            return None;
         }
 
         let client = match redis::Client::open(self.url.as_str()) {
             Ok(client) => client,
             Err(err) => {
                 warn!(error = %err, "invalid REDIS_URL, L2 disabled");
-                state.next_retry_at = Instant::now() + L2_RETRY_BACKOFF;
+                self.enabled.store(false, Ordering::Relaxed);
                 return None;
             }
         };
 
-        // 连接也要有超时：Redis 不可达时不能让请求卡在 SYN 上
+        // 注意：建连期间不持锁，否则并发请求会一起堵在这把锁上
         match tokio::time::timeout(
             L2_CONNECT_TIMEOUT,
             redis::aio::ConnectionManager::new(client),
@@ -103,18 +133,18 @@ impl L2Cache {
         .await
         {
             Ok(Ok(conn)) => {
-                info!("L2 cache (redis) connected");
+                let mut state = self.state.lock().await;
                 state.conn = Some(conn.clone());
                 Some(conn)
             }
             Ok(Err(err)) => {
-                warn!(error = %err, "redis connect failed, degraded to L1-only");
-                state.next_retry_at = Instant::now() + L2_RETRY_BACKOFF;
+                warn!(error = %err, "redis connect failed, L2 disabled (L1-only)");
+                self.enabled.store(false, Ordering::Relaxed);
                 None
             }
             Err(_) => {
-                warn!("redis connect timed out, degraded to L1-only");
-                state.next_retry_at = Instant::now() + L2_RETRY_BACKOFF;
+                warn!("redis connect timed out, L2 disabled (L1-only)");
+                self.enabled.store(false, Ordering::Relaxed);
                 None
             }
         }
@@ -131,21 +161,14 @@ impl L2Cache {
             serde_json::from_str::<SourceUrl>(raw.as_deref()?).ok()
         };
 
-        match tokio::time::timeout(L2_OP_TIMEOUT, lookup).await {
-            Ok(Some(url)) => {
-                debug!(%key, "L2 hit");
-                Some(url)
-            }
-            Ok(None) => None,
-            Err(_) => {
-                warn!(%key, "L2 GET timed out");
-                None
-            }
-        }
+        tokio::time::timeout(L2_OP_TIMEOUT, lookup).await.ok().flatten()
     }
 
     /// 回写 L2（带 TTL）。调用方通常 `tokio::spawn` 到后台，不阻塞响应。
     pub(crate) async fn set(&self, key: &str, url: &SourceUrl) {
+        if !self.is_enabled() {
+            return;
+        }
         let Some(mut conn) = self.connection().await else { return };
         let redis_key = format!("{}{}", L2_KEY_PREFIX, key);
         let payload = match serde_json::to_string(url) {
@@ -165,7 +188,7 @@ impl L2Cache {
         };
 
         match tokio::time::timeout(L2_OP_TIMEOUT, write).await {
-            Ok(Ok(())) => debug!(%key, "L2 write done"),
+            Ok(Ok(())) => {}
             Ok(Err(err)) => warn!(error = %err, %key, "L2 write failed"),
             Err(_) => warn!(%key, "L2 write timed out"),
         }

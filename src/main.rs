@@ -65,10 +65,10 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 // 常量
 // ---------------------------------------------------------------------------
 
-/// 单个上游请求的硬超时（需求 3：所有上游请求 800ms）
-const UPSTREAM_TIMEOUT: Duration = Duration::from_millis(800);
-/// 竞速整体的硬上限（兜底，比单请求超时略宽，避免误杀“刚好在 800ms 返回”的赢家）
-const RACE_DEADLINE: Duration = Duration::from_millis(850);
+/// 单个上游请求的硬超时：谁先回来用谁，500ms 还没回来的直接砍
+const UPSTREAM_TIMEOUT: Duration = Duration::from_millis(500);
+/// 竞速整体的硬上限（比单请求超时略宽，避免误杀「刚好在 500ms 返回」的赢家）
+const RACE_DEADLINE: Duration = Duration::from_millis(550);
 /// 同时在飞的上游请求上限（背压 / 过载保护）
 const UPSTREAM_MAX_INFLIGHT: usize = 2_000;
 
@@ -85,8 +85,6 @@ const L2_TTL_SECS: u64 = 30 * 60;
 /// Redis 读写超时：L2 只是加速层，绝不允许拖慢主链路
 const L2_OP_TIMEOUT: Duration = Duration::from_millis(150);
 const L2_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
-/// 连不上 Redis 后的熔断窗口，避免每个请求都去重连
-const L2_RETRY_BACKOFF: Duration = Duration::from_secs(5);
 
 const DEFAULT_SOURCE: &str = "kw";
 const DEFAULT_QUALITY: &str = "320k";
@@ -640,7 +638,9 @@ async fn main() -> Result<(), BoxError> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("info,audio_parse_gateway=debug")),
+                // 默认只放 info 及以上：每请求只剩一行 `upstream resolved` 与错误日志，
+                // 缓存命中/合并这类 debug 噪音默认不输出（排查时 RUST_LOG=debug 自己开）
+                .unwrap_or_else(|_| EnvFilter::new("error,audio_parse_gateway=info")),
         )
         .with_target(false)
         .compact()
@@ -664,9 +664,13 @@ async fn main() -> Result<(), BoxError> {
     let redis_url = std::env::var("REDIS_URL")
         .unwrap_or_else(|_| "redis://127.0.0.1:6379/".to_string());
 
+    // 启动探测：没装 Redis 就在这里把 L2 关掉，之后每个请求零等待（不再等 500ms 超时）
+    let l2 = Arc::new(L2Cache::new(redis_url));
+    let _ = l2.probe().await; // 探测结果不影响启动：连不上就是 L1-only
+
     let state = AppState {
         upstreams,
-        l2: Arc::new(L2Cache::new(redis_url)),
+        l2,
         flight: Arc::new(SingleFlight::default()),
         limiter: Arc::new(Semaphore::new(UPSTREAM_MAX_INFLIGHT)),
         stats: Arc::new(Stats::default()),
@@ -1102,6 +1106,32 @@ mod tests {
         assert!(
             text.contains("lx_gateway_quality_downgrades_total 1"),
             "实际输出:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn l2_disables_itself_after_one_failed_connect() {
+        // 指向一个必然拒绝连接的端口：探测失败后必须永久关闭，之后请求路径零等待
+        let l2 = L2Cache::new("redis://127.0.0.1:9/".to_string());
+        assert!(!l2.probe().await, "连不上就算探测失败");
+        assert!(!l2.is_enabled(), "探测失败后必须全局关闭 L2");
+
+        let started = Instant::now();
+        assert!(l2.get("l2-fast-path-1").await.is_none());
+        l2.set(
+            "l2-fast-path-1",
+            &SourceUrl {
+                url: "https://cdn.example/x.mp3".to_string(),
+                provider: "none".to_string(),
+                quality: "320k".to_string(),
+                expires_at: 0,
+            },
+        )
+        .await;
+        assert!(
+            started.elapsed() < Duration::from_millis(20),
+            "关掉 L2 之后读路径必须零等待，实际 {:?}",
+            started.elapsed()
         );
     }
 }

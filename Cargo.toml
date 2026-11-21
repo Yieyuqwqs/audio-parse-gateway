@@ -13,7 +13,7 @@ tokio = { version = "1", features = ["full"] }
 
 # ---------- 上游 HTTP 客户端（全局连接池） ----------
 # 用 rustls 而不是 native-tls，避免编译期依赖系统 OpenSSL
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip", "http2"] }
 
 # ---------- 缓存 ----------
 moka = { version = "0.12", features = ["future"] }   # L1：无锁并发内存缓存

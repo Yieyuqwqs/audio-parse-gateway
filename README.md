@@ -150,6 +150,8 @@ pub trait Upstream: Send + Sync + fmt::Debug {
 | `ENABLE_QQ=1` 或给 `TX_COOKIE` | 打开 QQ 音乐直连适配器（源 `tx`） |
 | `TX_COOKIE` | QQ 整段 cookie（`qm_keyst=...; uin=o0<QQ号>`），没有就只有 128k |
 | `TX_UIN` | QQ 号 —— 注意请求里要 `o0<QQ号>` 形式，适配器会自动补 |
+| `REDIS_URL` | Redis 地址；不配或连不上就只用 L1（启动探测，请求路径零等待） |
+| `RUST_LOG` | 日志级别，默认 `error,audio_parse_gateway=info` |
 
 ```bash
 # 接自建节点 + 网易云直连
@@ -233,7 +235,7 @@ TX_COOKIE='qm_keyst=...; uin=o02310476390'
 cargo test
 ```
 
-共 56 个用例，覆盖：适配层错误分类与 HTTP 状态映射（504 / 502 / 503）、节点响应多形状解析、
+共 57 个用例，覆盖：适配层错误分类与 HTTP 状态映射（504 / 502 / 503）、节点响应多形状解析、
 节点请求实发校验（本地回显服务验证 query / Bearer / Cookie 三件套）、网易云音质→码率与空 url 判定、
 竞速取最快 / 失败切换 / 全挂 502、singleflight 合并（6 并发只打 1 次上游）、L1 命中、过期直链不返回、
 过载 503、Prometheus 文本、参数校验、**音质协商与降档**（天花板筛选 / 静默降级如实上报 / 降档指标 / QQ 多档候选取最优），以及 **Redis L2 命中**（只认 `REDIS_URL`，本地没起 redis 就自动跳过）。
@@ -295,13 +297,48 @@ node bench/load.js http://127.0.0.1:8080 64 10 hot    # 同一个 id，测缓存
 压测时盯 `/metrics` 的 `lx_gateway_inflight_upstream`（≤ 2000）、`lx_gateway_singleflight_keys`（≤ 20000 且压完回 0）、
 `lx_gateway_coalesced_total`（hot 模式应上涨）。细节见 `bench/README.md`。
 
+## 性能（延迟预算）
+
+一次请求的预算排布：
+
+| 环节 | 上限 | 说明 |
+| --- | --- | --- |
+| L2（Redis）读 | 0ms（关掉时）/ 150ms（开着） | 启动探测失败就全局关闭，请求路径只剩一次原子变量判断 |
+| 单路上游 | **500ms** | 到点直接砍，不再等 800ms |
+| 整场竞速 | **550ms** | 兜底，防止某个适配器漏了超时 |
+| 建连 | **200ms** | 慢上游尽早出局，把预算让给能干活的那路 |
+| 空闲连接保留 | 300s | 跨请求复用，避免每次重新握手 |
+
+四件事决定体感：
+
+1. **Redis 不装就不碰**：`L2Cache::probe()` 只在启动时试连一次，失败立刻 `enabled=false`，
+   之后所有 `get` / `set` 都是原子变量判断 —— 不会再出现「每个请求等它超时 500ms」；
+   运行期也只尝试建连一次（`attempted` 兜底），彻底没有「每 5 秒重试一次、每次卡一下」的抖动。
+2. **连接池按「第二次请求零握手」配**：`pool_max_idle_per_host=200`、`pool_idle_timeout=300s`、
+   `tcp_keepalive(30s)`、`tcp_nodelay`，并开启 HTTP/2（ALPN 协商 + 空闲 keep-alive ping）。
+3. **日志只留两条**：默认 `RUST_LOG=error,audio_parse_gateway=info`，每请求只剩一行 `upstream resolved`
+   和错误日志；缓存命中 / 合并这类 debug 噪音默认不打印（排查时 `RUST_LOG=debug,audio_parse_gateway=debug`）。
+4. **超时砍到 500ms**：多路上游并发，谁先回来用谁，没回来的直接 abort（竞速整体 550ms 兜底）。
+
+验证连接复用：
+
+```bash
+curl -o /dev/null -s -w '1st %{time_total}s\n' 'http://127.0.0.1:8080/api/parse?id=1&source=kw'
+curl -o /dev/null -s -w '2nd %{time_total}s\n' 'http://127.0.0.1:8080/api/parse?id=2&source=kw'
+```
+
+第二次应明显低于第一次（省掉 TCP/TLS 握手）。冷启动第一发慢是正常的，别用第一发判断性能。
+
 ## 关键参数（改 main.rs 顶部常量即可）
 
 | 常量 | 值 | 说明 |
 | --- | --- | --- |
-| `UPSTREAM_TIMEOUT` | 800ms | 单个上游请求硬超时 |
-| `RACE_DEADLINE` | 850ms | 竞速整体硬上限 |
-| `POOL_MAX_IDLE_PER_HOST` | 100 | 每 host 空闲长连接数 |
+| `UPSTREAM_TIMEOUT` | 500ms | 单个上游请求硬超时（到点直接砍） |
+| `RACE_DEADLINE` | 550ms | 竞速整体硬上限 |
+| `CONNECT_TIMEOUT` | 200ms | 建连超时（`src/http.rs`） |
+| `POOL_MAX_IDLE_PER_HOST` | 200 | 每 host 空闲长连接数 |
+| `POOL_IDLE_TIMEOUT` | 300s | 空闲连接保留时长 |
+| `BODY_DEADLINE` | 800ms | reqwest 兜底超时（`src/http.rs`） |
 | `L1_CAPACITY` / `L1_TTL` | 10_000 / 30min | L1 容量与 TTL |
 | `L2_TTL_SECS` | 1800 | Redis TTL |
 | `UPSTREAM_MAX_INFLIGHT` | 2000 | 上游并发闸门，满了直接 503 |
