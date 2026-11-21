@@ -15,6 +15,8 @@ struct StatsSnapshot {
     cache_misses: u64,
     upstream_hits: u64,
     coalesced_requests: u64,
+    /// 因上游能力上限 / 接口静默降级而降低音质的请求数
+    downgraded_requests: u64,
     errors: u64,
 }
 
@@ -30,6 +32,7 @@ pub(crate) struct Stats {
     pub(crate) l2_hits: AtomicU64,
     pub(crate) upstream_hits: AtomicU64,
     pub(crate) coalesced: AtomicU64,
+    pub(crate) downgraded: AtomicU64,
     pub(crate) errors: AtomicU64,
 }
 
@@ -42,6 +45,7 @@ impl Stats {
             cache_misses: self.misses.load(Ordering::Relaxed),
             upstream_hits: self.upstream_hits.load(Ordering::Relaxed),
             coalesced_requests: self.coalesced.load(Ordering::Relaxed),
+            downgraded_requests: self.downgraded.load(Ordering::Relaxed),
             errors: self.errors.load(Ordering::Relaxed),
         }
     }
@@ -77,6 +81,9 @@ lx_gateway_upstream_requests_total {upstream}
 # HELP lx_gateway_coalesced_total 被 singleflight 合并掉的请求数
 # TYPE lx_gateway_coalesced_total counter
 lx_gateway_coalesced_total {coalesced}
+# HELP lx_gateway_quality_downgrades_total 实际音质低于请求档位的请求数
+# TYPE lx_gateway_quality_downgrades_total counter
+lx_gateway_quality_downgrades_total {downgraded}
 # HELP lx_gateway_errors_total 上游失败/超时的请求数
 # TYPE lx_gateway_errors_total counter
 lx_gateway_errors_total {errors}
@@ -93,6 +100,7 @@ lx_gateway_singleflight_keys {keys}
         misses = stats.cache_misses,
         upstream = stats.upstream_hits,
         coalesced = stats.coalesced_requests,
+        downgraded = stats.downgraded_requests,
         errors = stats.errors,
         inflight = inflight_upstream,
         keys = state.flight.len(),

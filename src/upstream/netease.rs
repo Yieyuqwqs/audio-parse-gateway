@@ -69,7 +69,9 @@ impl NeteaseUpstream {
             "128k" => Some(128_000),
             "320k" => Some(320_000),
             // 无损：999000 表示「最高可用」，具体给 flac 还是 24bit 由账号等级决定
-            "flac" | "flac24bit" => Some(999_000),
+            "flac" => Some(999_000),
+            // 24bit：能不能拿到看账号等级，够不着时接口会静默降成 320k
+            "flac24bit" => Some(1_999_000),
             _ => None,
         }
     }
@@ -83,6 +85,16 @@ impl Upstream for NeteaseUpstream {
 
     fn supports(&self, source: &str) -> bool {
         source == "wy"
+    }
+
+    /// 没带登录 cookie 时，实测 `br=999000` 只会返回 320k mp3（`level: exhigh`），
+    /// 那就别对外吹自己能给无损。
+    fn max_quality(&self) -> &'static str {
+        if self.cookie.is_some() {
+            crate::quality::TOP
+        } else {
+            "320k"
+        }
     }
 
     async fn resolve(&self, req: &TrackRequest) -> Result<SourceUrl, UpstreamError> {
@@ -137,6 +149,19 @@ impl Upstream for NeteaseUpstream {
     }
 }
 
+/// 从响应条目里读出**实际**档位：优先看 `level`，其次 `encodeType`/`type`，最后用 `br` 兜底。
+fn actual_quality(entry: &serde_json::Value) -> &'static str {
+    match entry.get("level").and_then(serde_json::Value::as_str) {
+        Some("hires") => crate::quality::LADDER[3],
+        Some("lossless") => crate::quality::LADDER[2],
+        Some("exhigh") => crate::quality::LADDER[1],
+        _ => {
+            let br = entry.get("br").and_then(serde_json::Value::as_u64).unwrap_or(0);
+            crate::quality::from_bitrate(br)
+        }
+    }
+}
+
 /// 解析网易云播放地址响应。
 pub(crate) fn parse_netease_body(
     upstream: &str,
@@ -182,7 +207,9 @@ pub(crate) fn parse_netease_body(
     Ok(SourceUrl {
         url: url.to_string(),
         provider: upstream.to_string(),
-        quality: quality.to_string(),
+        // 注意：这里写的是**实际**档位。无 cookie 请求 flac 时接口会回 mp3，
+        // 照样能播，但要老实上报成 320k，让上层把它标成「已降档」。
+        quality: actual_quality(entry).to_string(),
         expires_at: crate::now_unix() + expi,
     })
 }
@@ -196,7 +223,8 @@ mod tests {
         assert_eq!(NeteaseUpstream::bitrate_for("128k"), Some(128_000));
         assert_eq!(NeteaseUpstream::bitrate_for("320k"), Some(320_000));
         assert_eq!(NeteaseUpstream::bitrate_for("flac"), Some(999_000));
-        assert_eq!(NeteaseUpstream::bitrate_for("flac24bit"), Some(999_000));
+        // 24bit 走 1999000（够不着时接口会静默降成 320k，由 actual_quality 如实上报）
+        assert_eq!(NeteaseUpstream::bitrate_for("flac24bit"), Some(1_999_000));
         assert_eq!(NeteaseUpstream::bitrate_for("48k"), None);
     }
 
@@ -281,5 +309,43 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, UpstreamError::Unsupported { .. }));
         assert!(!err.is_retryable());
+    }
+
+    #[test]
+    fn reports_actual_quality_from_level_field() {
+        let lossless = r#"{"data":[{"url":"http://cdn/a.flac","br":999000,"level":"lossless","code":200}],"code":200}"#;
+        let parsed = parse_netease_body("netease", "flac", lossless).expect("lossless");
+        assert_eq!(parsed.quality, "flac");
+
+        let hires = r#"{"data":[{"url":"http://cdn/b.flac","br":1999000,"level":"hires","code":200}],"code":200}"#;
+        let parsed = parse_netease_body("netease", "flac24bit", hires).expect("hires");
+        assert_eq!(parsed.quality, "flac24bit");
+
+        let exhigh = r#"{"data":[{"url":"http://cdn/c.mp3","br":320000,"level":"exhigh","code":200}],"code":200}"#;
+        let parsed = parse_netease_body("netease", "320k", exhigh).expect("exhigh");
+        assert_eq!(parsed.quality, "320k");
+    }
+
+    #[test]
+    fn silent_downgrade_reports_the_real_quality() {
+        // 请求 flac，但没 cookie 时接口会回 320k mp3（实测 level=exhigh）：
+        // 直链照样能播，但上报的档位必须是真的 320k。
+        let body = r#"{"data":[{"url":"http://cdn/c.mp3","br":320000,"level":"exhigh","code":200,"fee":8}],"code":200}"#;
+        let parsed = parse_netease_body("netease", "flac", body).expect("downgraded but playable");
+        assert_eq!(parsed.quality, "320k");
+        assert_ne!(parsed.quality, "flac");
+    }
+
+    #[test]
+    fn max_quality_depends_on_login_cookie() {
+        let anonymous = NeteaseUpstream::new(Duration::from_millis(800));
+        assert_eq!(anonymous.max_quality(), "320k", "没 cookie 只能保证 320k");
+
+        let member = anonymous.with_cookie(Some("MUSIC_U=abc".to_string()));
+        assert_eq!(member.max_quality(), crate::quality::TOP);
+
+        // 空 cookie 等于没有
+        let blank = NeteaseUpstream::new(Duration::from_millis(800)).with_cookie(Some("  ".to_string()));
+        assert_eq!(blank.max_quality(), "320k");
     }
 }

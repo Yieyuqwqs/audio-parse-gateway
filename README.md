@@ -21,6 +21,7 @@ UPSTREAM_A_URL=https://node-a.example.com UPSTREAM_B_URL=https://node-b.example.
 | `src/main.rs` | 路由、参数校验、`AppState::resolve` 主链路、适配器装配、启动与优雅退出 |
 | `src/cache.rs` | L1（moka 无锁内存）、L2（Redis ConnectionManager + 熔断降级）、singleflight 门闩 |
 | `src/metrics.rs` | Atomic 指标 + Prometheus 文本输出 |
+| `src/quality.rs` | 音质阶梯：档位排序、降档、能力判定、`br`→档位映射 |
 | `src/http.rs` | 全局连接池（进程内唯一 reqwest Client） |
 | `src/upstream/` | 适配层：`Upstream` trait + 节点 / 网易云 / mock 三个实现 |
 
@@ -42,6 +43,8 @@ curl 'http://127.0.0.1:8080/metrics'
     "url": "https://cdn-upstream-a.lx-mock.example/kw/320k/123456.flac",
     "source": "kw",
     "quality": "320k",
+    "requested_quality": "flac",
+    "downgraded": true,
     "provider": "upstream-a",
     "cache": "l1",
     "coalesced": false,
@@ -141,7 +144,7 @@ pub trait Upstream: Send + Sync + fmt::Debug {
 | `UPSTREAM_A_TOKEN` / `UPSTREAM_B_TOKEN` | 节点鉴权：`Authorization: Bearer <token>` |
 | `UPSTREAM_A_COOKIE` / `UPSTREAM_B_COOKIE` | 节点会话 cookie（平台反爬/登录态靠它，逐字透传不改写） |
 | `ENABLE_NETEASE=1` | 打开网易云直连适配器 |
-| `NETEASE_COOKIE` | 网易云登录 cookie（解锁高音质） |
+| `NETEASE_COOKIE` | 网易云登录 cookie：**只有带上它才可能拿到 flac / flac24bit**，否则最高 320k |
 | `NETEASE_BASE` | 网易云接口反代地址，默认 `https://music.163.com` |
 
 ```bash
@@ -158,16 +161,45 @@ cargo run --release
 > 没有合法 `Hm_Iuvt` 会话就只会回 `The request is illegal!`，旧的 `anti.s` 接口已经退化成返回同一个兜底文件。
 > 所以这类源现阶段走**「节点 + cookie/token」**：节点自己做签名，网关负责缓存、竞速与容错。
 
+## 高音质（`flac` / `flac24bit`）
+
+网关不会把「请求了 flac」当成「拿到了 flac」。音质走一条明确的阶梯：
+
+```text
+128k  <  320k  <  flac  <  flac24bit
+```
+
+两件事由 `src/quality.rs` + `Upstream::max_quality` 决定：
+
+1. **能力协商**：每个适配器声明自己的天花板。请求档位超过所有适配器的天花板时，
+   进门就沿阶梯降档（例如全部只到 320k，就直接按 320k 打，不会白打一次 flac 再失败）；
+2. **如实上报**：上游可能连协商后的档位都没给到（网易云就会静默降级）。
+   响应里的 `quality` 是**实际**档位，`requested_quality` 是请求档位，`downgraded` 标记本次是否降档。
+
+网易云实测（2026-11-21，无登录 cookie）：
+
+| 请求 | 接口参数 | 实际返回 |
+| --- | --- | --- |
+| `320k` | `br=320000` | 320k mp3（`level: exhigh`） |
+| `flac` | `br=999000` | **静默降成 320k mp3**，不会报错 |
+| `flac24bit` | `br=1999000` | 同上，没会员 cookie 拿不到 24bit |
+
+所以想让 LX 真的放无损，只有两条路：给节点/网易云配**有会员的 cookie**（`NETEASE_COOKIE` / `UPSTREAM_A_COOKIE`），
+或让自建节点自己解决签名。带上 cookie 后 `NeteaseUpstream::max_quality()` 会自动升到 `flac24bit`。
+
+降档次数进指标 `lx_gateway_quality_downgrades_total`；如果它一直涨、播放器又显示无损，
+说明客户端把「请求档位」当成了实际档位 —— 那是播放器侧的问题，网关这边的语义是准的。
+
 ## 测试
 
 ```bash
 cargo test
 ```
 
-共 35 个用例，覆盖：适配层错误分类与 HTTP 状态映射（504 / 502 / 503）、节点响应多形状解析、
+共 42 个用例，覆盖：适配层错误分类与 HTTP 状态映射（504 / 502 / 503）、节点响应多形状解析、
 节点请求实发校验（本地回显服务验证 query / Bearer / Cookie 三件套）、网易云音质→码率与空 url 判定、
 竞速取最快 / 失败切换 / 全挂 502、singleflight 合并（6 并发只打 1 次上游）、L1 命中、过期直链不返回、
-过载 503、Prometheus 文本、参数校验，以及 **Redis L2 命中**（只认 `REDIS_URL`，本地没起 redis 就自动跳过）。
+过载 503、Prometheus 文本、参数校验、**音质协商与降档**（天花板筛选 / 静默降级如实上报 / 降档指标），以及 **Redis L2 命中**（只认 `REDIS_URL`，本地没起 redis 就自动跳过）。
 CI 里 `cargo build --release`、`cargo test`、`cargo clippy` 都会跑，并且带一个 `redis:7-alpine` service 给 L2 用例用。
 
 ## 部署
@@ -237,6 +269,7 @@ curl -s http://127.0.0.1:8080/metrics
 | `lx_gateway_cache_misses_total` | counter | 首查未命中的请求数（要走合并/上游） |
 | `lx_gateway_upstream_requests_total` | counter | 真正打穿到上游并成功的次数（≈ 上游配额消耗） |
 | `lx_gateway_coalesced_total` | counter | 被 singleflight 合并掉的次数（防击穿生效的证据） |
+| `lx_gateway_quality_downgrades_total` | counter | 实际档位低于请求档位的次数（能力上限或接口静默降级） |
 | `lx_gateway_errors_total` | counter | 上游失败 / 超时 |
 | `lx_gateway_inflight_upstream` | gauge | 当前在飞的上游请求数（≤ 2000） |
 | `lx_gateway_singleflight_keys` | gauge | 当前门闩表大小（≤ 20000） |

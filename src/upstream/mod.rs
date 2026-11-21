@@ -118,6 +118,20 @@ pub trait Upstream: Send + Sync + fmt::Debug {
     /// 是否支持这个音源 key（竞速前先过滤，避免拿 kg 的 id 去打 kw 的接口）
     fn supports(&self, source: &str) -> bool;
 
+    /// 这路上游最高能给到哪一档，默认按「无损全开」算。
+    ///
+    /// 会实事求是地往下调：比如网易云没带登录 cookie 时，实测 `br=999000`
+    /// 只会被静默降级成 320k mp3，那它就该老实返回 `320k`，
+    /// 让网关提前降档，别浪费一次请求去够一个够不着的档位。
+    fn max_quality(&self) -> &'static str {
+        crate::quality::TOP
+    }
+
+    /// 能不能服务这个 `(source, quality)` 组合 —— 竞速前用它筛候选。
+    fn serves(&self, source: &str, quality: &str) -> bool {
+        self.supports(source) && crate::quality::within(quality, self.max_quality())
+    }
+
     /// 解析直链。实现方**必须**给自己的请求套上硬超时。
     async fn resolve(&self, req: &TrackRequest) -> Result<SourceUrl, UpstreamError>;
 }
@@ -134,7 +148,7 @@ pub async fn race(
 ) -> Result<SourceUrl, UpstreamError> {
     let candidates: Vec<&Arc<dyn Upstream>> = upstreams
         .iter()
-        .filter(|upstream| upstream.supports(req.source))
+        .filter(|upstream| upstream.serves(req.source, req.quality))
         .collect();
     if candidates.is_empty() {
         return Err(UpstreamError::NoCandidate { source_key: req.source.to_string() });

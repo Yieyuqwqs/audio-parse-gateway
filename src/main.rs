@@ -48,11 +48,13 @@ use tracing_subscriber::EnvFilter;
 mod cache;
 mod http;
 mod metrics;
+mod quality;
 mod upstream;
 
 use upstream::{MockUpstream, NeteaseUpstream, NodeUpstream, TrackRequest, Upstream, UpstreamError};
 
 pub(crate) use cache::{L2Cache, SingleFlight, L1_CACHE};
+pub(crate) use quality::normalize as normalize_quality;
 pub(crate) use metrics::{metrics_handler, Stats};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -88,8 +90,7 @@ const DEFAULT_SOURCE: &str = "kw";
 const DEFAULT_QUALITY: &str = "320k";
 /// LX 支持的源 key
 const SUPPORTED_SOURCES: [&str; 6] = ["kw", "kg", "tx", "wy", "mg", "local"];
-/// LX 支持的音质
-const SUPPORTED_QUALITIES: [&str; 4] = ["128k", "320k", "flac", "flac24bit"];
+
 
 // ---------------------------------------------------------------------------
 // 领域模型
@@ -207,7 +208,12 @@ struct TrackData {
     /// 直链，自定义源脚本里直接 `return resp.data.url`
     url: String,
     source: String,
+    /// **实际**拿到的音质档位（可能低于请求档位）
     quality: String,
+    /// 客户端请求的档位
+    requested_quality: String,
+    /// 实际档位低于请求档位（例如没会员 cookie 时 flac 只能给 320k）
+    downgraded: bool,
     /// 哪个上游节点给的
     provider: String,
     /// 命中层级：l1 / l2 / upstream
@@ -245,24 +251,41 @@ struct Resolved {
     url: SourceUrl,
     /// l1 / l2 / upstream
     layer: &'static str,
+    /// 客户端请求的音质档位（可能被协商降档）
+    requested: &'static str,
     /// 是否等待了别人的在途请求
     coalesced: bool,
 }
 
+impl Resolved {
+    fn new(url: SourceUrl, layer: &'static str, requested: &'static str, coalesced: bool) -> Self {
+        Self { url, layer, requested, coalesced }
+    }
+
+    /// 实际拿到的档位是否低于请求档位 —— 响应里要如实标出来，别让播放器以为拿到了 flac。
+    fn downgraded(&self) -> bool {
+        !self.url.quality.is_empty() && self.url.quality != self.requested
+    }
+}
+
 impl AppState {
-    /// 核心链路：L1 → L2 → singleflight → 竞速上游 → 回填缓存
+    /// 核心链路：音质协商 → L1 → L2 → singleflight → 竞速上游 → 回填缓存
     async fn resolve(
         &self,
         source: &'static str,
         music_id: &str,
-        quality: &'static str,
+        requested: &'static str,
     ) -> Result<Resolved, AppError> {
-        // 缓存 key 与适配层共用同一套拼法，避免两处漂移
+        // 高音质请求先做「能力协商」：没有上游能到这一档就沿阶梯往下走，
+        // 免得每打一次 flac 都要先空跑一次、再靠失败来降档。
+        let quality = self.effective_quality(source, requested);
+
+        // 缓存 key 与适配层共用同一套拼法，避免两处漂移（按**协商后**的档位缓存）
         let key = TrackRequest::new(source, music_id, quality).cache_key();
 
         // ---- 1) L1 / L2：绝大多数请求在这里结束，纯内存、无锁读 ----
-        if let Some(hit) = self.cache_lookup(&key).await {
-            return Ok(hit);
+        if let Some((url, layer)) = self.cache_lookup(&key).await {
+            return Ok(Resolved::new(url, layer, requested, false));
         }
         self.stats.misses.fetch_add(1, Ordering::Relaxed);
 
@@ -270,7 +293,7 @@ impl AppState {
         let gate = self.flight.gate(&key);
 
         let result = self
-            .resolve_locked(&key, source, music_id, quality, gate.as_ref())
+            .resolve_locked(&key, source, music_id, quality, requested, gate.as_ref())
             .await;
 
         // 无论成功失败都要摘门闩，否则表项会泄漏
@@ -280,6 +303,27 @@ impl AppState {
         result
     }
 
+    /// 能力协商：沿音质阶梯往下找，取「真的有上游能服务」的最高档。
+    ///
+    /// 全都够不着时返回原始档位，让竞速层照常报 `NoCandidate`，
+    /// 免得把「参数/源配错」这种问题伪装成「降档成功」。
+    fn effective_quality(&self, source: &str, requested: &'static str) -> &'static str {
+        let mut candidate = requested;
+        loop {
+            if self
+                .upstreams
+                .iter()
+                .any(|upstream| upstream.serves(source, candidate))
+            {
+                return candidate;
+            }
+            match quality::downgrade(candidate) {
+                Some(next) => candidate = next,
+                None => return requested,
+            }
+        }
+    }
+
     /// 持锁之后的逻辑（锁在函数内部获取，保证任何返回路径都会释放）
     async fn resolve_locked(
         &self,
@@ -287,6 +331,7 @@ impl AppState {
         source: &'static str,
         music_id: &str,
         quality: &'static str,
+        requested: &'static str,
         gate: Option<&Arc<Mutex<()>>>,
     ) -> Result<Resolved, AppError> {
         // try_lock 成功 → 我们就是 leader，**从这一步起一直持锁**，不存在竞态窗口；
@@ -308,9 +353,8 @@ impl AppState {
 
         // 二次检查：如果我们是等待者，leader 此刻已经把结果写进 L1/L2 了；
         // 如果 leader 挂了，我们顺势成为新的 leader。这就是「防击穿」的关键。
-        if let Some(mut hit) = self.cache_lookup(key).await {
-            hit.coalesced = coalesced;
-            return Ok(hit);
+        if let Some((url, layer)) = self.cache_lookup(key).await {
+            return Ok(Resolved::new(url, layer, requested, coalesced));
         }
 
         // ---- 3) 上游竞速（唯一的穿透点） ----
@@ -318,7 +362,7 @@ impl AppState {
         let permit = self.limiter.try_acquire().map_err(|_| AppError::Overloaded)?;
 
         let request = TrackRequest::new(source, music_id, quality);
-        let url = match upstream::race(&self.upstreams, &request, RACE_DEADLINE).await {
+        let mut url = match upstream::race(&self.upstreams, &request, RACE_DEADLINE).await {
             Ok(url) => url,
             Err(err) => {
                 self.stats.errors.fetch_add(1, Ordering::Relaxed);
@@ -328,10 +372,17 @@ impl AppState {
         };
         drop(permit);
 
+        // 上游可能连协商后的档位都没给到（网易云就可能静默降级）：
+        // 空档位补成请求档位，其余以实际返回为准，响应里会标 `downgraded`。
+        if url.quality.is_empty() {
+            url.quality = quality.to_string();
+        }
+
         self.stats.upstream_hits.fetch_add(1, Ordering::Relaxed);
         info!(
             %key,
             provider = %url.provider,
+            actual_quality = %url.quality,
             "upstream resolved"
         );
 
@@ -345,16 +396,16 @@ impl AppState {
             tokio::spawn(async move { l2.set(&key, &payload).await });
         }
 
-        Ok(Resolved { url, layer: "upstream", coalesced })
+        Ok(Resolved::new(url, "upstream", requested, coalesced))
     }
 
-    /// L1 → L2 的读路径（带直链有效期校验）
-    async fn cache_lookup(&self, key: &str) -> Option<Resolved> {
+    /// L1 → L2 的读路径（带直链有效期校验），返回 `(直链, 命中层级)`
+    async fn cache_lookup(&self, key: &str) -> Option<(SourceUrl, &'static str)> {
         // L1
         if let Some(hit) = L1_CACHE.get(key).await {
             if hit.is_fresh() {
                 self.stats.l1_hits.fetch_add(1, Ordering::Relaxed);
-                return Some(Resolved { url: (*hit).clone(), layer: "l1", coalesced: false });
+                return Some(((*hit).clone(), "l1"));
             }
             // 直链已过期：主动剔除，避免继续返回死链
             L1_CACHE.invalidate(key).await;
@@ -370,7 +421,7 @@ impl AppState {
             self.stats.l2_hits.fetch_add(1, Ordering::Relaxed);
             // 回填 L1：下一次同 key 请求直接命中内存
             L1_CACHE.insert(key.to_owned(), Arc::new(hit.clone())).await;
-            return Some(Resolved { url: hit, layer: "l2", coalesced: false });
+            return Some((hit, "l2"));
         }
 
         None
@@ -423,13 +474,25 @@ async fn respond(
 
     let resolved = state.resolve(source, music_id, quality).await?;
 
+    let downgraded = resolved.downgraded();
+    if downgraded {
+        state.stats.downgraded.fetch_add(1, Ordering::Relaxed);
+        debug!(
+            requested = quality,
+            actual = %resolved.url.quality,
+            "quality downgraded (adapter ceiling or silent downgrade)"
+        );
+    }
+
     Ok(Json(OkBody {
         code: 0,
         msg: "success",
         data: TrackData {
             url: resolved.url.url,
             source: source.to_string(),
-            quality: quality.to_string(),
+            quality: resolved.url.quality.clone(),
+            requested_quality: quality.to_string(),
+            downgraded,
             provider: resolved.url.provider,
             cache: resolved.layer,
             coalesced: resolved.coalesced,
@@ -455,19 +518,6 @@ fn normalize_source(raw: Option<&str>) -> Result<&'static str, AppError> {
         .ok_or_else(|| {
             AppError::BadRequest(format!(
                 "`source` must be one of {:?}, got `{value}`", SUPPORTED_SOURCES
-            ))
-        })
-}
-
-fn normalize_quality(raw: Option<&str>) -> Result<&'static str, AppError> {
-    let value = raw.map(str::trim).filter(|v| !v.is_empty()).unwrap_or(DEFAULT_QUALITY);
-    SUPPORTED_QUALITIES
-        .iter()
-        .copied()
-        .find(|candidate| candidate.eq_ignore_ascii_case(value))
-        .ok_or_else(|| {
-            AppError::BadRequest(format!(
-                "`quality` must be one of {:?}, got `{value}`", SUPPORTED_QUALITIES
             ))
         })
 }
@@ -660,13 +710,14 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
 
-    /// 可编程的假适配器：能配延迟、强制失败、只支持某个音源。
+    /// 可编程的假适配器：能配延迟、强制失败、只支持某个音源、最高只给到某档音质。
     #[derive(Debug)]
     struct FakeUpstream {
         name: &'static str,
         delay: Duration,
         fails: bool,
         only: Option<&'static str>,
+        ceiling: &'static str,
         calls: Arc<AtomicUsize>,
     }
 
@@ -677,6 +728,7 @@ mod tests {
                 delay: Duration::ZERO,
                 fails: false,
                 only: None,
+                ceiling: quality::TOP,
                 calls: Arc::new(AtomicUsize::new(0)),
             }
         }
@@ -695,6 +747,12 @@ mod tests {
             self.only = Some(source);
             self
         }
+
+        /// 模拟「这路上游最高只能给到这一档」，比如没 cookie 的网易云
+        fn with_ceiling(mut self, ceiling: &'static str) -> Self {
+            self.ceiling = ceiling;
+            self
+        }
     }
 
     #[async_trait::async_trait]
@@ -705,6 +763,10 @@ mod tests {
 
         fn supports(&self, source: &str) -> bool {
             self.only.is_none_or(|only| only == source)
+        }
+
+        fn max_quality(&self) -> &'static str {
+            self.ceiling
         }
 
         async fn resolve(&self, req: &TrackRequest) -> Result<SourceUrl, UpstreamError> {
@@ -955,5 +1017,70 @@ mod tests {
             .expect("L2 命中应该直接返回");
         assert_eq!(resolved.layer, "l2", "应该是从 Redis 拿到的");
         assert_eq!(resolved.url.url, "https://cdn-l2.example/seeded.mp3");
+    }
+
+    #[tokio::test]
+    async fn quality_is_downgraded_when_no_adapter_reaches_it() {
+        // 最高只到 320k 的适配器 + 请求 flac：应该直接按 320k 打过去，
+        // 而不是先拿 flac 白打一次、再靠失败来降档。
+        let upstreams: Vec<Arc<dyn Upstream>> =
+            vec![Arc::new(FakeUpstream::new("lossy-only").with_ceiling("320k"))];
+        let resolved = state_with(upstreams)
+            .resolve("wy", "quality-downgrade-1", "flac")
+            .await
+            .expect("协商降档之后应该能成功");
+
+        assert_eq!(resolved.url.quality, "320k", "实际档位要如实上报");
+        assert!(resolved.downgraded(), "flac → 320k 必须标记成降档");
+    }
+
+    #[tokio::test]
+    async fn full_quality_passes_through_when_adapter_supports_it() {
+        // 默认 ceiling 是 flac24bit（无损全开），请求什么就该拿到什么
+        let upstreams: Vec<Arc<dyn Upstream>> = vec![Arc::new(FakeUpstream::new("lossless"))];
+        let resolved = state_with(upstreams)
+            .resolve("wy", "quality-full-1", "flac24bit")
+            .await
+            .expect("无损适配器应该原样返回");
+
+        assert_eq!(resolved.url.quality, "flac24bit");
+        assert!(!resolved.downgraded());
+    }
+
+    #[tokio::test]
+    async fn response_reports_requested_and_actual_quality() {
+        let upstreams: Vec<Arc<dyn Upstream>> =
+            vec![Arc::new(FakeUpstream::new("lossy").with_ceiling("320k"))];
+        let state = state_with(upstreams);
+
+        let payload = respond(&state, "wy", "quality-report-1", "flac")
+            .await
+            .expect("降档之后仍然是成功响应");
+
+        assert_eq!(payload.0.code, 0);
+        assert_eq!(payload.0.data.requested_quality, "flac");
+        assert_eq!(payload.0.data.quality, "320k");
+        assert!(payload.0.data.downgraded);
+    }
+
+    #[tokio::test]
+    async fn metrics_counts_quality_downgrades() {
+        let upstreams: Vec<Arc<dyn Upstream>> =
+            vec![Arc::new(FakeUpstream::new("lossy-m").with_ceiling("320k"))];
+        let state = state_with(upstreams);
+        respond(&state, "wy", "quality-metric-1", "flac")
+            .await
+            .expect("降档请求");
+
+        let response = metrics_handler(State(state)).await.into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let text = String::from_utf8(body.to_vec()).expect("utf8");
+
+        assert!(
+            text.contains("lx_gateway_quality_downgrades_total 1"),
+            "实际输出:\n{text}"
+        );
     }
 }
