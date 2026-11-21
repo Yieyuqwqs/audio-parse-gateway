@@ -40,6 +40,7 @@ use axum::{
     routing::get,
     Json, Router,
 };
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, Semaphore};
 use tracing::{debug, info, warn};
@@ -47,7 +48,9 @@ use tracing_subscriber::EnvFilter;
 
 mod cache;
 mod http;
+mod logfmt;
 mod metrics;
+mod proxy;
 mod quality;
 mod upstream;
 
@@ -69,6 +72,8 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 const UPSTREAM_TIMEOUT: Duration = Duration::from_millis(500);
 /// 竞速整体的硬上限（比单请求超时略宽，避免误杀「刚好在 500ms 返回」的赢家）
 const RACE_DEADLINE: Duration = Duration::from_millis(550);
+/// 音质降级链（flac24bit→flac→320k→128k）总共只允许花这么久
+const FALLBACK_BUDGET: Duration = Duration::from_millis(1_200);
 /// 同时在飞的上游请求上限（背压 / 过载保护）
 const UPSTREAM_MAX_INFLIGHT: usize = 2_000;
 
@@ -155,14 +160,21 @@ impl From<UpstreamError> for AppError {
     }
 }
 
-impl IntoResponse for AppError {
-    fn into_response(self) -> Response {
-        let status = match &self {
+impl AppError {
+    /// 对外 HTTP 状态码：响应头和访问日志共用同一套映射
+    fn status(&self) -> StatusCode {
+        match self {
             AppError::BadRequest(_) => StatusCode::BAD_REQUEST,
             AppError::Http(_) | AppError::Upstream(_) => StatusCode::BAD_GATEWAY,
             AppError::Timeout(_) => StatusCode::GATEWAY_TIMEOUT,
             AppError::Overloaded => StatusCode::SERVICE_UNAVAILABLE,
-        };
+        }
+    }
+}
+
+impl IntoResponse for AppError {
+    fn into_response(self) -> Response {
+        let status = self.status();
 
         if status.is_server_error() {
             warn!(error = %self, "request failed");
@@ -188,6 +200,67 @@ struct ParseQuery {
     source: Option<String>,
     /// 音质：128k / 320k / flac / flac24bit，默认 320k
     quality: Option<String>,
+    /// `fallback=1`：主源彻底失败后允许去网易云二次搜索
+    fallback: Option<String>,
+    /// 搜索关键词；不给就用 `name` + `singer` 拼
+    keyword: Option<String>,
+    /// 歌曲名（跨平台回退用）
+    name: Option<String>,
+    /// 歌手名（跨平台回退用）
+    singer: Option<String>,
+}
+
+/// 一次解析的可选行为（跨平台回退开关 + 关键词）
+#[derive(Debug, Clone, Default)]
+struct ParseOptions {
+    /// 主源失败后是否允许跨平台二次搜索
+    fallback: bool,
+    keyword: Option<String>,
+}
+
+impl ParseOptions {
+    fn from_query(query: &ParseQuery) -> Self {
+        let fallback = query
+            .fallback
+            .as_deref()
+            .map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false);
+
+        let keyword = query
+            .keyword
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                let name = query.name.as_deref().unwrap_or("").trim();
+                if name.is_empty() {
+                    return None;
+                }
+                let singer = query.singer.as_deref().unwrap_or("").trim();
+                Some(if singer.is_empty() {
+                    name.to_string()
+                } else {
+                    format!("{name} {singer}")
+                })
+            });
+
+        Self { fallback, keyword }
+    }
+
+    /// 允许回退时才把关键词交出去
+    fn fallback_keyword(&self) -> Option<String> {
+        if self.fallback {
+            self.keyword.clone()
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -243,6 +316,8 @@ struct AppState {
     /// 上游并发闸门：过载时直接 503，保护自己也不压垮上游
     pub(crate) limiter: Arc<Semaphore>,
     pub(crate) stats: Arc<Stats>,
+    /// 防盗链代拉的短链表
+    pub(crate) proxy: Arc<proxy::ProxyStore>,
 }
 
 /// 一次解析的结果 + 命中信息
@@ -255,11 +330,19 @@ struct Resolved {
     requested: &'static str,
     /// 是否等待了别人的在途请求
     coalesced: bool,
+    /// 真正给出直链的音源（跨平台回退后可能是 `wy`）
+    source: &'static str,
 }
 
 impl Resolved {
-    fn new(url: SourceUrl, layer: &'static str, requested: &'static str, coalesced: bool) -> Self {
-        Self { url, layer, requested, coalesced }
+    fn new(
+        url: SourceUrl,
+        layer: &'static str,
+        requested: &'static str,
+        coalesced: bool,
+        source: &'static str,
+    ) -> Self {
+        Self { url, layer, requested, coalesced, source }
     }
 
     /// 实际拿到的档位是否低于请求档位 —— 响应里要如实标出来，别让播放器以为拿到了 flac。
@@ -269,7 +352,7 @@ impl Resolved {
 }
 
 impl AppState {
-    /// 核心链路：音质协商 → L1 → L2 → singleflight → 竞速上游 → 回填缓存
+    /// 核心链路：音质协商 → L1 → L2 → singleflight → 竞速（含降级链）→ 回填缓存
     async fn resolve(
         &self,
         source: &'static str,
@@ -285,7 +368,7 @@ impl AppState {
 
         // ---- 1) L1 / L2：绝大多数请求在这里结束，纯内存、无锁读 ----
         if let Some((url, layer)) = self.cache_lookup(&key).await {
-            return Ok(Resolved::new(url, layer, requested, false));
+            return Ok(Resolved::new(url, layer, requested, false, source));
         }
         self.stats.misses.fetch_add(1, Ordering::Relaxed);
 
@@ -354,37 +437,76 @@ impl AppState {
         // 二次检查：如果我们是等待者，leader 此刻已经把结果写进 L1/L2 了；
         // 如果 leader 挂了，我们顺势成为新的 leader。这就是「防击穿」的关键。
         if let Some((url, layer)) = self.cache_lookup(key).await {
-            return Ok(Resolved::new(url, layer, requested, coalesced));
+            return Ok(Resolved::new(url, layer, requested, coalesced, source));
         }
 
         // ---- 3) 上游竞速（唯一的穿透点） ----
         // 过载保护：拿不到令牌就快速失败，而不是把请求堆在队列里拖垮自己
         let permit = self.limiter.try_acquire().map_err(|_| AppError::Overloaded)?;
 
-        let request = TrackRequest::new(source, music_id, quality);
-        let mut url = match upstream::race(&self.upstreams, &request, RACE_DEADLINE).await {
-            Ok(url) => url,
-            Err(err) => {
-                self.stats.errors.fetch_add(1, Ordering::Relaxed);
-                warn!(upstream = err.upstream(), error = %err, "upstream race failed");
-                return Err(AppError::from(err));
+        // 音质降级链：flac24bit → flac → 320k → 128k。
+        // 只有「这一档拿不到」（NoUrl / 4xx）才值得降档；超时/过载直接放弃，别把预算烧光。
+        let deadline_at = Instant::now() + FALLBACK_BUDGET;
+        let mut candidate = quality;
+        let mut winner: Option<SourceUrl> = None;
+        let mut last_error: Option<UpstreamError> = None;
+
+        loop {
+            let remaining = deadline_at.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
             }
-        };
+            let slice = RACE_DEADLINE.min(remaining);
+            let request = TrackRequest::new(source, music_id, candidate);
+            match upstream::race(&self.upstreams, &request, slice).await {
+                Ok(url) => {
+                    winner = Some(url);
+                    break;
+                }
+                Err(err) => {
+                    let degradable = match &err {
+                        UpstreamError::NoUrl { .. } | UpstreamError::Unsupported { .. } => true,
+                        UpstreamError::Status { status, .. } => status.is_client_error(),
+                        _ => false,
+                    };
+                    last_error = Some(err);
+                    if !degradable {
+                        break;
+                    }
+                    match quality::downgrade(candidate) {
+                        Some(next) => candidate = next,
+                        None => break,
+                    }
+                }
+            }
+        }
         drop(permit);
+
+        let Some(mut url) = winner else {
+            self.stats.errors.fetch_add(1, Ordering::Relaxed);
+            let err = last_error.unwrap_or(UpstreamError::NoCandidate {
+                source_key: source.to_string(),
+            });
+            warn!(source, id = music_id, error = %err, "all upstreams failed after the quality chain");
+            return Err(AppError::from(err));
+        };
 
         // 上游可能连协商后的档位都没给到（网易云就可能静默降级）：
         // 空档位补成请求档位，其余以实际返回为准，响应里会标 `downgraded`。
         if url.quality.is_empty() {
-            url.quality = quality.to_string();
+            url.quality = candidate.to_string();
+        }
+
+        // 防盗链：有些平台的直链不认客户端裸请求（403）。
+        // 探测到 401/403/405 就换成网关代拉的短链，代拉时会补齐 Referer。
+        if self.should_proxy(source) {
+            let referer = upstream::referer_for(source);
+            if proxy::ProxyStore::needs_proxy(&url.url, referer).await {
+                url.url = self.proxy.link(url.url.clone(), referer.to_string());
+            }
         }
 
         self.stats.upstream_hits.fetch_add(1, Ordering::Relaxed);
-        info!(
-            %key,
-            provider = %url.provider,
-            actual_quality = %url.quality,
-            "upstream resolved"
-        );
 
         // ---- 4) 回填缓存：L1 同步写（极快），L2 丢后台 ----
         L1_CACHE.insert(key.to_owned(), Arc::new(url.clone())).await;
@@ -396,7 +518,42 @@ impl AppState {
             tokio::spawn(async move { l2.set(&key, &payload).await });
         }
 
-        Ok(Resolved::new(url, "upstream", requested, coalesced))
+        Ok(Resolved::new(url, "upstream", requested, coalesced, source))
+    }
+
+    /// 跨平台回退：主源彻底失败时，拿关键词去网易云搜一次再解析。
+    ///
+    /// 目前只有网易云实现了真实搜索（kw/kg 的搜索接口都要反爬会话，见 README）。
+    async fn cross_source(
+        &self,
+        keyword: &str,
+        quality: &'static str,
+    ) -> Result<Resolved, AppError> {
+        let searcher = self
+            .upstreams
+            .iter()
+            .find(|upstream| upstream.name() == "netease")
+            .cloned()
+            .ok_or_else(|| {
+                AppError::Upstream("cross-source fallback needs the netease adapter".to_string())
+            })?;
+
+        let song_id = searcher.search_keyword(keyword).await.map_err(AppError::from)?;
+        debug!(search = keyword, song_id = %song_id, "cross-source fallback matched a track");
+        self.resolve("wy", &song_id, quality).await
+    }
+
+    /// 这个源的直链要不要走网关代拉（`AUTO_PROXY`，默认只代拉 `tx`）
+    fn should_proxy(&self, source: &str) -> bool {
+        static AUTO_PROXY: Lazy<Vec<String>> = Lazy::new(|| {
+            std::env::var("AUTO_PROXY")
+                .unwrap_or_else(|_| "tx".to_string())
+                .split(',')
+                .map(|item| item.trim().to_string())
+                .filter(|item| !item.is_empty())
+                .collect()
+        });
+        AUTO_PROXY.iter().any(|item| item == source)
     }
 
     /// L1 → L2 的读路径（带直链有效期校验），返回 `(直链, 命中层级)`
@@ -439,7 +596,21 @@ impl AppState {
 // 6. 路由与 handler
 // ---------------------------------------------------------------------------
 
+/// 一行访问日志 —— 这是进程里唯一的正常输出（其它 INFO/DEBUG 都被格式化器吞掉）
+fn access_log(status: u16, source: &str, music_id: &str, quality: &str, started: Instant) {
+    tracing::info!(
+        target: logfmt::ACCESS_TARGET,
+        status = status,
+        source = source,
+        id = music_id,
+        quality = quality,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+    );
+}
+
 /// `GET /api/parse?id=<musicId>&source=kw&quality=320k`
+///
+/// 跨平台回退示例：`?source=tx&id=<songmid>&fallback=1&name=海阔天空&singer=Beyond`
 async fn parse_handler(
     State(state): State<AppState>,
     Query(query): Query<ParseQuery>,
@@ -447,7 +618,8 @@ async fn parse_handler(
     let source = normalize_source(query.source.as_deref())?;
     let quality = normalize_quality(query.quality.as_deref())?;
     let music_id = validate_music_id(query.id.as_deref())?;
-    respond(&state, source, music_id, quality).await
+    let options = ParseOptions::from_query(&query);
+    respond(&state, source, music_id, quality, &options).await
 }
 
 /// `GET /url/{source}/{music_id}?quality=320k`（LX 风格的短链接口，方便脚本直连）
@@ -459,37 +631,61 @@ async fn lx_url_handler(
     let source = normalize_source(Some(source.as_str()))?;
     let quality = normalize_quality(query.quality.as_deref())?;
     let music_id = validate_music_id(Some(music_id.as_str()))?;
-    respond(&state, source, music_id, quality).await
+    respond(&state, source, music_id, quality, &ParseOptions::default()).await
 }
 
-/// 两个入口共用的响应组装：解析 → LX 响应包
+/// 两个入口共用的响应组装：解析（含降级链 / 跨平台回退） → LX 响应包 → 一行访问日志
 async fn respond(
     state: &AppState,
     source: &'static str,
     music_id: &str,
     quality: &'static str,
+    options: &ParseOptions,
 ) -> Result<Json<OkBody>, AppError> {
     let started = Instant::now();
     state.stats.total.fetch_add(1, Ordering::Relaxed);
 
-    let resolved = state.resolve(source, music_id, quality).await?;
+    let resolved = match state.resolve(source, music_id, quality).await {
+        Ok(resolved) => resolved,
+        Err(primary) => {
+            // 主源彻底失败：如果客户端要跨平台且给了关键词，就去网易云再搜一次
+            let Some(keyword) = options.fallback_keyword() else {
+                access_log(primary.status().as_u16(), source, music_id, quality, started);
+                return Err(primary);
+            };
+            match state.cross_source(&keyword, quality).await {
+                Ok(resolved) => {
+                    debug!(search = %keyword, "cross-source fallback served the request");
+                    resolved
+                }
+                Err(fallback_err) => {
+                    debug!(error = %fallback_err, "cross-source fallback also failed");
+                    access_log(primary.status().as_u16(), source, music_id, quality, started);
+                    return Err(primary);
+                }
+            }
+        }
+    };
 
     let downgraded = resolved.downgraded();
     if downgraded {
         state.stats.downgraded.fetch_add(1, Ordering::Relaxed);
-        debug!(
-            requested = quality,
-            actual = %resolved.url.quality,
-            "quality downgraded (adapter ceiling or silent downgrade)"
-        );
     }
+
+    access_log(
+        200,
+        resolved.source,
+        music_id,
+        &resolved.url.quality,
+        started,
+    );
 
     Ok(Json(OkBody {
         code: 0,
         msg: "success",
         data: TrackData {
             url: resolved.url.url,
-            source: source.to_string(),
+            source: resolved.source.to_string(),
             quality: resolved.url.quality.clone(),
             requested_quality: quality.to_string(),
             downgraded,
@@ -501,8 +697,118 @@ async fn respond(
     }))
 }
 
-async fn health_handler() -> &'static str {
-    "ok"
+/// 五个平台各自有多少适配器在服务（启动自检与 `/health` 共用）
+fn platform_matrix(upstreams: &[Arc<dyn Upstream>]) -> serde_json::Value {
+    const PLATFORMS: [&str; 5] = ["tx", "kg", "kw", "wy", "mg"];
+    let mut platforms = serde_json::Map::new();
+    for source in PLATFORMS {
+        let adapters: Vec<&str> = upstreams
+            .iter()
+            .filter(|upstream| upstream.supports(source))
+            .map(|upstream| upstream.name())
+            .collect();
+        platforms.insert(
+            source.to_string(),
+            serde_json::json!({ "adapters": adapters, "ok": !adapters.is_empty() }),
+        );
+    }
+    serde_json::Value::Object(platforms)
+}
+
+/// `GET /health`：五平台适配器矩阵 + L2 状态，直接给监控/压测脚本用
+async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
+    const PLATFORMS: [&str; 5] = ["tx", "kg", "kw", "wy", "mg"];
+    let platforms = platform_matrix(&state.upstreams);
+
+    let missing: Vec<String> = PLATFORMS
+        .iter()
+        .filter(|source| {
+            !platforms
+                .get(**source)
+                .and_then(|entry| entry.get("ok"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        })
+        .map(|source| (*source).to_string())
+        .collect();
+
+    let status = if missing.is_empty() { "ok" } else { "degraded" };
+    Json(serde_json::json!({
+        "status": status,
+        "l2": state.l2.is_enabled(),
+        "adapters": state.upstreams.len(),
+        "platforms": platforms,
+        "missing_platforms": missing,
+    }))
+}
+
+/// 启动自检用的一首样曲（`kg` 需要真实 hash，拿不到就跳过）
+fn sample_id(source: &str) -> Option<&'static str> {
+    match source {
+        "tx" => Some("002lzYCa14usQ5"),
+        "wy" => Some("347230"),
+        "kw" => Some("347230"),
+        "mg" => Some("60090844416"),
+        _ => None,
+    }
+}
+
+/// 启动自检：先看五个平台各自有没有适配器，`STARTUP_PROBE=1` 时再五路并发真打一发
+async fn startup_health_check(state: &AppState) {
+    const PLATFORMS: [&str; 5] = ["tx", "kg", "kw", "wy", "mg"];
+    let platforms = platform_matrix(&state.upstreams);
+    info!(matrix = %platforms, "startup health check");
+
+    for source in PLATFORMS {
+        let ok = platforms
+            .get(source)
+            .and_then(|entry| entry.get("ok"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        if !ok {
+            warn!(
+                platform = source,
+                "startup health check: no adapter for this platform（缺节点/cookie，只能靠跨平台回退）"
+            );
+        }
+    }
+
+    let probe_enabled = std::env::var("STARTUP_PROBE")
+        .map(|value| !value.is_empty() && value != "0")
+        .unwrap_or(false);
+    if !probe_enabled {
+        return;
+    }
+
+    let mut tasks = tokio::task::JoinSet::new();
+    for source in PLATFORMS {
+        let Some(sample) = sample_id(source) else {
+            warn!(platform = source, "startup probe skipped: no sample track id");
+            continue;
+        };
+        let state = state.clone();
+        tasks.spawn(async move {
+            let started = Instant::now();
+            let probe = tokio::time::timeout(
+                Duration::from_millis(800),
+                state.resolve(source, sample, "128k"),
+            )
+            .await;
+            (source, matches!(probe, Ok(Ok(_))), started.elapsed())
+        });
+    }
+
+    while let Some(joined) = tasks.join_next().await {
+        match joined {
+            Ok((source, true, elapsed)) => {
+                info!(platform = source, elapsed_ms = elapsed.as_millis() as u64, "startup probe ok");
+            }
+            Ok((source, false, elapsed)) => {
+                warn!(platform = source, elapsed_ms = elapsed.as_millis() as u64, "startup probe failed");
+            }
+            Err(err) => warn!(error = %err, "startup probe task panicked"),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -635,15 +941,15 @@ fn build_upstreams() -> Arc<Vec<Arc<dyn Upstream>>> {
 
 #[tokio::main]
 async fn main() -> Result<(), BoxError> {
+    // 极客日志：自定义 FormatEvent。只有 target = "access" 的事件会渲染成一行
+    // （08:53:38 | [200] tx 002RsKKv2Rd7Ih        flac      | 780ms），
+    // 其它 INFO/DEBUG（启动信息、连接池、缓存命中）全部吞掉，WARN/ERROR 留精简版。
     tracing_subscriber::fmt()
+        .event_format(logfmt::AccessFormat)
         .with_env_filter(
             EnvFilter::try_from_default_env()
-                // 默认只放 info 及以上：每请求只剩一行 `upstream resolved` 与错误日志，
-                // 缓存命中/合并这类 debug 噪音默认不输出（排查时 RUST_LOG=debug 自己开）
-                .unwrap_or_else(|_| EnvFilter::new("error,audio_parse_gateway=info")),
+                .unwrap_or_else(|_| EnvFilter::new("error,access=info,audio_parse_gateway=info")),
         )
-        .with_target(false)
-        .compact()
         .init();
 
     // 预热全局连接池（配置错在启动期就炸，而不是等第一个请求）
@@ -674,13 +980,19 @@ async fn main() -> Result<(), BoxError> {
         flight: Arc::new(SingleFlight::default()),
         limiter: Arc::new(Semaphore::new(UPSTREAM_MAX_INFLIGHT)),
         stats: Arc::new(Stats::default()),
+        proxy: Arc::new(proxy::ProxyStore::new()),
     };
+
+    // 启动自检：tx/kg/kw/wy/mg 五平台的适配器矩阵（STARTUP_PROBE=1 时再并发真打一发）
+    startup_health_check(&state).await;
 
     let app = Router::new()
         .route("/api/parse", get(parse_handler))
         .route("/url/{source}/{music_id}", get(lx_url_handler))
         .route("/health", get(health_handler))
         .route("/metrics", get(metrics_handler))
+        // 防盗链代拉：/stream/{token} 会补齐 Referer 再把音频流吐回去
+        .route("/stream/{token}", get(proxy::stream_handler))
         .with_state(state);
 
     let addr: SocketAddr = std::env::var("BIND_ADDR")
@@ -742,6 +1054,10 @@ mod tests {
         fails: bool,
         only: Option<&'static str>,
         ceiling: &'static str,
+        /// 高于这一档的音质直接拒绝（模拟「无损没版权/没会员」）
+        fail_above: Option<&'static str>,
+        /// 关键词搜索能返回的 id（跨平台回退用）
+        search_result: Option<&'static str>,
         calls: Arc<AtomicUsize>,
     }
 
@@ -753,6 +1069,8 @@ mod tests {
                 fails: false,
                 only: None,
                 ceiling: quality::TOP,
+                fail_above: None,
+                search_result: None,
                 calls: Arc::new(AtomicUsize::new(0)),
             }
         }
@@ -777,6 +1095,18 @@ mod tests {
             self.ceiling = ceiling;
             self
         }
+
+        /// 模拟「高于这一档就拒绝」：请求 320k 可以，flac 直接 NoUrl
+        fn failing_above(mut self, ceiling: &'static str) -> Self {
+            self.fail_above = Some(ceiling);
+            self
+        }
+
+        /// 模拟一个支持关键词搜索的适配器（跨平台回退用）
+        fn can_search(mut self, id: &'static str) -> Self {
+            self.search_result = Some(id);
+            self
+        }
     }
 
     #[async_trait::async_trait]
@@ -793,8 +1123,26 @@ mod tests {
             self.ceiling
         }
 
+        async fn search_keyword(&self, keyword: &str) -> Result<String, UpstreamError> {
+            match self.search_result {
+                Some(id) => Ok(id.to_string()),
+                None => Err(UpstreamError::Unsupported {
+                    upstream: self.name.to_string(),
+                    source_key: format!("search:{keyword}"),
+                }),
+            }
+        }
+
         async fn resolve(&self, req: &TrackRequest) -> Result<SourceUrl, UpstreamError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(limit) = self.fail_above {
+                if !quality::within(req.quality, limit) {
+                    return Err(UpstreamError::NoUrl {
+                        upstream: self.name.to_string(),
+                        detail: format!("{} not available", req.quality),
+                    });
+                }
+            }
             if !self.delay.is_zero() {
                 tokio::time::sleep(self.delay).await;
             }
@@ -827,6 +1175,7 @@ mod tests {
             flight: Arc::new(SingleFlight::default()),
             limiter: Arc::new(Semaphore::new(64)),
             stats: Arc::new(Stats::default()),
+            proxy: Arc::new(proxy::ProxyStore::new()),
         }
     }
 
@@ -977,7 +1326,7 @@ mod tests {
         let upstreams: Vec<Arc<dyn Upstream>> = vec![Arc::new(FakeUpstream::new("m"))];
         let state = state_with(upstreams);
         // 必须走 handler（respond）才会累加 requests_total；直接 resolve 只动命中/穿透计数
-        let payload = respond(&state, "kw", "metrics-1", "320k")
+        let payload = respond(&state, "kw", "metrics-1", "320k", &ParseOptions::default())
             .await
             .expect("先打一发");
         assert_eq!(payload.0.code, 0);
@@ -1077,7 +1426,7 @@ mod tests {
             vec![Arc::new(FakeUpstream::new("lossy").with_ceiling("320k"))];
         let state = state_with(upstreams);
 
-        let payload = respond(&state, "wy", "quality-report-1", "flac")
+        let payload = respond(&state, "wy", "quality-report-1", "flac", &ParseOptions::default())
             .await
             .expect("降档之后仍然是成功响应");
 
@@ -1092,7 +1441,7 @@ mod tests {
         let upstreams: Vec<Arc<dyn Upstream>> =
             vec![Arc::new(FakeUpstream::new("lossy-m").with_ceiling("320k"))];
         let state = state_with(upstreams);
-        let payload = respond(&state, "wy", "quality-metric-1", "flac")
+        let payload = respond(&state, "wy", "quality-metric-1", "flac", &ParseOptions::default())
             .await
             .expect("降档请求");
         assert!(payload.0.data.downgraded, "这一发本来就该降档");
@@ -1133,5 +1482,78 @@ mod tests {
             "关掉 L2 之后读路径必须零等待，实际 {:?}",
             started.elapsed()
         );
+    }
+
+    #[tokio::test]
+    async fn quality_chain_falls_back_until_something_plays() {
+        // 只有 320k 有版权：请求 flac24bit 应该一路降档到 320k，而不是直接 502
+        let upstreams: Vec<Arc<dyn Upstream>> =
+            vec![Arc::new(FakeUpstream::new("lossy-chain").failing_above("320k"))];
+
+        let resolved = state_with(upstreams)
+            .resolve("wy", "chain-1", "flac24bit")
+            .await
+            .expect("降级链应该救回来");
+
+        assert_eq!(resolved.url.quality, "320k");
+        assert!(resolved.downgraded(), "flac24bit → 320k 要标记降档");
+    }
+
+    #[tokio::test]
+    async fn cross_source_fallback_searches_netease() {
+        // 主源 tx 没有任何适配器；网易云适配器能搜到 id=999
+        let upstreams: Vec<Arc<dyn Upstream>> = vec![
+            Arc::new(FakeUpstream::new("netease").only_for("wy").can_search("999")),
+        ];
+        let state = state_with(upstreams);
+
+        let options = ParseOptions {
+            fallback: true,
+            keyword: Some("海阔天空 Beyond".to_string()),
+        };
+        let payload = respond(&state, "tx", "002RsKKv2Rd7Ih", "320k", &options)
+            .await
+            .expect("跨平台回退应该成功");
+
+        assert_eq!(payload.0.code, 0);
+        assert_eq!(payload.0.data.source, "wy", "回退后应报实际的源");
+        assert!(payload.0.data.url.contains("999"), "应走搜索到的 id");
+    }
+
+    #[tokio::test]
+    async fn cross_source_is_skipped_without_fallback_flag() {
+        let upstreams: Vec<Arc<dyn Upstream>> = vec![
+            Arc::new(FakeUpstream::new("netease").only_for("wy").can_search("999")),
+        ];
+        let state = state_with(upstreams);
+
+        // 没给 fallback=1：就算有关键词也不该去搜
+        let options = ParseOptions {
+            fallback: false,
+            keyword: Some("海阔天空".to_string()),
+        };
+        let err = respond(&state, "tx", "002RsKKv2Rd7Ih", "320k", &options)
+            .await
+            .unwrap_err();
+        assert_eq!(err.into_response().status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    fn health_matrix_covers_all_five_platforms() {
+        let upstreams: Vec<Arc<dyn Upstream>> = vec![
+            Arc::new(FakeUpstream::new("qq").only_for("tx")),
+            Arc::new(FakeUpstream::new("any")),
+        ];
+
+        let matrix = platform_matrix(&upstreams);
+        for source in ["tx", "kg", "kw", "wy", "mg"] {
+            let ok = matrix
+                .get(source)
+                .and_then(|entry| entry.get("ok"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            assert!(ok, "{source} 应该至少有适配器在服务");
+        }
+        assert_eq!(matrix.get("tx").and_then(|entry| entry.get("adapters")).map(|v| v.as_array().map(|a| a.len()).unwrap_or(0)), Some(2));
     }
 }

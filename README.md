@@ -151,7 +151,9 @@ pub trait Upstream: Send + Sync + fmt::Debug {
 | `TX_COOKIE` | QQ 整段 cookie（`qm_keyst=...; uin=o0<QQ号>`），没有就只有 128k |
 | `TX_UIN` | QQ 号 —— 注意请求里要 `o0<QQ号>` 形式，适配器会自动补 |
 | `REDIS_URL` | Redis 地址；不配或连不上就只用 L1（启动探测，请求路径零等待） |
-| `RUST_LOG` | 日志级别，默认 `error,audio_parse_gateway=info` |
+| `RUST_LOG` | 日志级别，默认 `error,access=info,audio_parse_gateway=info` |
+| `AUTO_PROXY` | 需要网关代拉的源（逗号分隔），默认 `tx`；留空即关闭 |
+| `STARTUP_PROBE=1` | 启动时对五个平台各真打一发探活 |
 
 ```bash
 # 接自建节点 + 网易云直连
@@ -235,7 +237,7 @@ TX_COOKIE='qm_keyst=...; uin=o02310476390'
 cargo test
 ```
 
-共 57 个用例，覆盖：适配层错误分类与 HTTP 状态映射（504 / 502 / 503）、节点响应多形状解析、
+共 70 个用例，覆盖：适配层错误分类与 HTTP 状态映射（504 / 502 / 503）、节点响应多形状解析、
 节点请求实发校验（本地回显服务验证 query / Bearer / Cookie 三件套）、网易云音质→码率与空 url 判定、
 竞速取最快 / 失败切换 / 全挂 502、singleflight 合并（6 并发只打 1 次上游）、L1 命中、过期直链不返回、
 过载 503、Prometheus 文本、参数校验、**音质协商与降档**（天花板筛选 / 静默降级如实上报 / 降档指标 / QQ 多档候选取最优），以及 **Redis L2 命中**（只认 `REDIS_URL`，本地没起 redis 就自动跳过）。
@@ -297,6 +299,89 @@ node bench/load.js http://127.0.0.1:8080 64 10 hot    # 同一个 id，测缓存
 压测时盯 `/metrics` 的 `lx_gateway_inflight_upstream`（≤ 2000）、`lx_gateway_singleflight_keys`（≤ 20000 且压完回 0）、
 `lx_gateway_coalesced_total`（hot 模式应上涨）。细节见 `bench/README.md`。
 
+## 极客日志（自定义 `FormatEvent`）
+
+日志不再靠 filter 缩小，而是直接在 `src/logfmt.rs` 里重写渲染（`tracing_subscriber::fmt().event_format(...)`）：
+
+```text
+08:53:38 | [200] tx 002RsKKv2Rd7Ih        flac      | 780ms
+08:53:39 | [502] wy 347230                320k      | 512ms
+```
+
+* 时间只到秒（`%H:%M:%S`）；
+* 2xx → `\x1b[32m` 绿，4xx/5xx → `\x1b[31m` 红；
+* 列宽固定：`source` 2 列、`id` 22 列、`quality` 10 列，终端里能直接对齐扫读；
+* **只有 `target = "access"` 的事件会打成这一行**，其余 INFO/DEBUG（启动信息、连接池、缓存命中、合并）全部吞掉；
+* WARN/ERROR 保留一行精简版（`08:53:39 ERROR ...`），排障时不至于瞎。
+
+实现要点：`AccessFields` 用 `tracing::field::Visit` 把 `status/source/id/quality/elapsed_ms` 抠出来，
+`render_line()` 负责对齐与配色（单测里断言了和你给的样例逐字符一致）。
+
+## 跨平台回退（`fallback=1`）
+
+主源彻底失败时，如果客户端带了搜索需求，会去网易云二次搜索再解析：
+
+```bash
+# tx 的 id 解析失败 → 用关键词去 wy 搜一次 → 返回 wy 的直链
+curl 'localhost:8080/api/parse?source=tx&id=002RsKKv2Rd7Ih&quality=flac&fallback=1&name=海阔天空&singer=Beyond'
+```
+
+* 关键词：`keyword=` 优先，否则用 `name` + `singer` 拼；
+* 不给 `fallback=1` 就**不会**跨平台搜（避免「明明要 QQ 的版本却给了网易云」）；
+* 响应里的 `source` 会变成实际的源（例如 `wy`），`provider` 仍是具体适配器；
+* 目前只有网易云实现了真实搜索：kw/kg 的搜索接口都要反爬会话（实测酷我直接 `The request is illegal!`），
+  适配器层已经留好 `Upstream::search_keyword()`，等节点/cookie 到位就能接上。
+
+## 音质降级链（网关级）
+
+除了「按适配器天花板提前降档」，现在竞速层还有一条**真正会重试**的降级链：
+
+```text
+flac24bit → flac → 320k → 128k
+```
+
+* 只有「这一档拿不到」（`NoUrl` / 4xx）才继续降；超时/过载直接放弃，不烧预算；
+* 整条链共用一个 `FALLBACK_BUDGET = 1200ms` 的预算，每一跳用 `min(550ms, 剩余预算)`；
+* 拿到任何一档能播的直链就返回，响应里 `quality` 是实际档位、`downgraded=true`。
+
+## 防盗链代拉（`/stream/{token}`）
+
+有些平台的直链不认客户端裸请求（403）。现在的处理：
+
+1. 解析成功后，对 `AUTO_PROXY`（默认 `tx`）里的平台做一次带 `Referer` 的 `Range: bytes=0-0` HEAD 探测；
+2. 探测到 `401/403/405` → 把直链换成网关短链 `/stream/{token}`；
+3. 客户端拉 `/stream/{token}` 时，网关补齐 `Referer`（`https://y.qq.com/` 等）+ `User-Agent`，把音频流原样转发；
+4. token 只存进程内、10 分钟过期，不落盘；探测失败（超时/网络错）一律按「不需要代拉」处理，宁可直接给直链。
+
+`AUTO_PROXY=` （空）可关掉代拉；`AUTO_PROXY=tx,wy` 可扩展。
+
+## 启动健康检查 / `/health`
+
+启动时先自检五个平台（tx/kg/kw/wy/mg）各自有几个适配器，缺哪个就 `warn` 一条；
+再加 `STARTUP_PROBE=1` 会五路并发真打一发（800ms 上限），失败只 warn 不影响启动。
+
+```bash
+curl -s localhost:8080/health
+```
+
+```json
+{
+  "status": "degraded",
+  "l2": false,
+  "adapters": 2,
+  "platforms": {
+    "tx": { "adapters": ["qq"], "ok": true },
+    "kg": { "adapters": [], "ok": false },
+    "kw": { "adapters": [], "ok": false },
+    "wy": { "adapters": ["netease"], "ok": true },
+    "mg": { "adapters": [], "ok": false }
+  },
+  "missing_platforms": ["kg", "kw", "mg"]
+}
+```
+
+`status` 只有五个平台都有适配器时才是 `ok`；压测脚本可以直接拿它当 readiness 探针。
+
 ## 性能（延迟预算）
 
 一次请求的预算排布：
@@ -339,6 +424,7 @@ curl -o /dev/null -s -w '2nd %{time_total}s\n' 'http://127.0.0.1:8080/api/parse?
 | `POOL_MAX_IDLE_PER_HOST` | 200 | 每 host 空闲长连接数 |
 | `POOL_IDLE_TIMEOUT` | 300s | 空闲连接保留时长 |
 | `BODY_DEADLINE` | 800ms | reqwest 兜底超时（`src/http.rs`） |
+| `FALLBACK_BUDGET` | 1200ms | 音质降级链总预算 |
 | `L1_CAPACITY` / `L1_TTL` | 10_000 / 30min | L1 容量与 TTL |
 | `L2_TTL_SECS` | 1800 | Redis TTL |
 | `UPSTREAM_MAX_INFLIGHT` | 2000 | 上游并发闸门，满了直接 503 |

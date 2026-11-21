@@ -25,6 +25,9 @@ use crate::{
 
 /// 官方接口路径
 const API_PATH: &str = "/api/song/enhance/player/url";
+/// 关键词搜索路径（跨平台回退用）
+const SEARCH_PATH: &str = "/api/search/get";
+
 /// 官方默认有效期（接口没给 `expi` 时兜底）
 const DEFAULT_EXPI_SECS: u64 = 1_200;
 
@@ -147,6 +150,52 @@ impl Upstream for NeteaseUpstream {
             }),
         }
     }
+
+    /// 关键词搜索（跨平台回退用）：返回第一首歌的 id。
+    ///
+    /// 打在 `api/search/get` 上，游客就能搜到（不像 QQ 的 soso 对游客返回空列表）。
+    async fn search_keyword(&self, keyword: &str) -> Result<String, UpstreamError> {
+        let keyword = keyword.trim();
+        if keyword.is_empty() {
+            return Err(UpstreamError::NoUrl {
+                upstream: self.name.clone(),
+                detail: "empty search keyword".to_string(),
+            });
+        }
+
+        let endpoint = format!("{}{}", self.base.trim_end_matches('/'), SEARCH_PATH);
+        let attempt = async {
+            let mut builder = crate::http::client()
+                .get(endpoint.as_str())
+                .header(reqwest::header::REFERER, "https://music.163.com/")
+                .query(&[("s", keyword), ("type", "1"), ("limit", "5")]);
+            if let Some(cookie) = self.cookie.as_deref() {
+                builder = builder.header(reqwest::header::COOKIE, cookie);
+            }
+
+            let response = builder.send().await.map_err(|source| UpstreamError::Transport {
+                upstream: self.name.clone(),
+                source,
+            })?;
+            let status = response.status();
+            if !status.is_success() {
+                return Err(UpstreamError::Status { upstream: self.name.clone(), status });
+            }
+            let body = response.text().await.map_err(|source| UpstreamError::Transport {
+                upstream: self.name.clone(),
+                source,
+            })?;
+            parse_search_body(&self.name, &body)
+        };
+
+        match tokio::time::timeout(self.timeout, attempt).await {
+            Ok(result) => result,
+            Err(_) => Err(UpstreamError::Timeout {
+                upstream: self.name.clone(),
+                after: self.timeout,
+            }),
+        }
+    }
 }
 
 /// 从响应条目里读出**实际**档位：优先看 `level`，其次 `encodeType`/`type`，最后用 `br` 兜底。
@@ -160,6 +209,31 @@ fn actual_quality(entry: &serde_json::Value) -> &'static str {
             crate::quality::from_bitrate(br)
         }
     }
+}
+
+/// 解析搜索响应，取第一首歌的 id。
+pub(crate) fn parse_search_body(upstream: &str, body: &str) -> Result<String, UpstreamError> {
+    let value: serde_json::Value =
+        serde_json::from_str(body).map_err(|err| UpstreamError::Decode {
+            upstream: upstream.to_string(),
+            detail: err.to_string(),
+        })?;
+
+    let first = value
+        .get("result")
+        .and_then(|result| result.get("songs"))
+        .and_then(serde_json::Value::as_array)
+        .and_then(|songs| songs.first());
+
+    let id = first
+        .and_then(|song| song.get("id"))
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| UpstreamError::NoUrl {
+            upstream: upstream.to_string(),
+            detail: "search returned no songs".to_string(),
+        })?;
+
+    Ok(id.to_string())
 }
 
 /// 解析网易云播放地址响应。
@@ -347,5 +421,17 @@ mod tests {
         // 空 cookie 等于没有
         let blank = NeteaseUpstream::new(Duration::from_millis(800)).with_cookie(Some("  ".to_string()));
         assert_eq!(blank.max_quality(), "320k");
+    }
+
+    #[test]
+    fn parses_search_result_into_the_first_song_id() {
+        let body = r#"{"result":{"songs":[{"id":111,"name":"a"},{"id":222,"name":"b"}]},"code":200}"#;
+        assert_eq!(
+            parse_search_body("netease", body).expect("应该取第一首"),
+            "111"
+        );
+
+        let empty = r#"{"result":{"songs":[]}}"#;
+        assert!(parse_search_body("netease", empty).is_err(), "搜不到要报错");
     }
 }

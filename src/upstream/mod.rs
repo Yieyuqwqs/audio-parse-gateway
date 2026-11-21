@@ -25,6 +25,18 @@ pub use netease::NeteaseUpstream;
 pub use node::NodeUpstream;
 pub use qq::QqUpstream;
 
+/// 平台直链的防盗链 `Referer`（代拉与探活用）。
+pub(crate) fn referer_for(source: &str) -> &'static str {
+    match source {
+        "tx" => "https://y.qq.com/",
+        "wy" => "https://music.163.com/",
+        "kw" => "https://www.kuwo.cn/",
+        "kg" => "https://www.kugou.com/",
+        "mg" => "https://music.migu.cn/",
+        _ => "",
+    }
+}
+
 /// 一次解析请求。
 ///
 /// `music_id` 用 owned `String` 是为了让请求能被 `tokio::spawn` 搬进独立 task
@@ -136,6 +148,16 @@ pub trait Upstream: Send + Sync + fmt::Debug {
 
     /// 解析直链。实现方**必须**给自己的请求套上硬超时。
     async fn resolve(&self, req: &TrackRequest) -> Result<SourceUrl, UpstreamError>;
+
+    /// 关键词搜索：跨平台回退（tx 全挂了去 wy 再找一次）用。
+    ///
+    /// 默认不支持 —— 目前只有网易云实现了真实搜索；kw/kg 的搜索接口都有反爬会话要求，见 README。
+    async fn search_keyword(&self, keyword: &str) -> Result<String, UpstreamError> {
+        Err(UpstreamError::Unsupported {
+            upstream: self.name().to_string(),
+            source_key: format!("search:{keyword}"),
+        })
+    }
 }
 
 /// 竞速：同时打所有支持该音源的上游，谁先成功用谁，其余立刻取消。
