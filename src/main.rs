@@ -1178,7 +1178,10 @@ mod tests {
     async fn metrics_exposes_prometheus_text() {
         let upstreams: Vec<Arc<dyn Upstream>> = vec![Arc::new(FakeUpstream::new("m"))];
         let state = state_with(upstreams);
-        state.resolve("kw", "metrics-1", "320k").await.expect("先打一发");
+        // 必须走 handler（respond）才会累加 requests_total；直接 resolve 只动命中/穿透计数
+        respond(&state, "kw", "metrics-1", "320k")
+            .await
+            .expect("先打一发");
 
         let response = metrics_handler(State(state)).await.into_response();
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
