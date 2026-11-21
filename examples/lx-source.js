@@ -37,7 +37,7 @@ const fetchMusicUrl = (params) => new Promise((resolve, reject) => {
 
     const data = body.data || {}
     if (!data.url) return reject(new Error('响应里没有 url'))
-    if (isMockUrl(data.url)) {
+    if (data.mock === true || isMockUrl(data.url)) {
       return reject(new Error('网关只有 mock 上游：请检查 Termux 里 ~/audio-parse-gateway/.env（ENABLE_QQ / ENABLE_NETEASE）并重启'))
     }
     resolve(data.url)

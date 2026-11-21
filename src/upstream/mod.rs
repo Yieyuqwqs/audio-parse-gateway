@@ -149,6 +149,14 @@ pub trait Upstream: Send + Sync + fmt::Debug {
     /// 解析直链。实现方**必须**给自己的请求套上硬超时。
     async fn resolve(&self, req: &TrackRequest) -> Result<SourceUrl, UpstreamError>;
 
+    /// 预热连接（DNS + TLS 握手），让第一发真实请求也走连接池。默认不用预热。
+    async fn warm_up(&self) {}
+
+    /// 是不是进程内的 mock 适配器（响应里要标出来，别让播放器以为拿到了真直链）
+    fn is_mock(&self) -> bool {
+        false
+    }
+
     /// 关键词搜索：跨平台回退（tx 全挂了去 wy 再找一次）用。
     ///
     /// 默认不支持 —— 目前只有网易云实现了真实搜索；kw/kg 的搜索接口都有反爬会话要求，见 README。

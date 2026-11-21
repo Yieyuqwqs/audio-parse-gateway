@@ -22,8 +22,12 @@ pub(crate) const POOL_MAX_IDLE_PER_HOST: usize = 200;
 pub(crate) const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 /// TCP keep-alive 探测间隔
 pub(crate) const TCP_KEEPALIVE: Duration = Duration::from_secs(30);
-/// 建连超时：慢上游尽早出局（整个上游预算只有 500ms）
-pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
+/// 建连超时：**包含 TCP + TLS 握手**。
+///
+/// 实测手机网络到 `u.y.qq.com`：TCP ~65ms、TLS 累计 ~190~220ms，原来设 200ms 会卡在边界上
+/// 随机 "error sending request"。给到 450ms，剩下 50ms 留给真正的接口响应；
+/// 稳态靠连接池复用（这里只在冷启动/连接被回收时才走握手）。
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_millis(450);
 /// reqwest 自身的兜底超时。真正的 SLO 由各适配器的 `tokio::time::timeout` 保证，
 /// 这里只是防止某条路径漏包超时后把连接永远占住。
 const BODY_DEADLINE: Duration = Duration::from_millis(800);

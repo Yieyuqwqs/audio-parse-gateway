@@ -287,6 +287,8 @@ struct TrackData {
     requested_quality: String,
     /// 实际档位低于请求档位（例如没会员 cookie 时 flac 只能给 320k）
     downgraded: bool,
+    /// 直链来自进程内 mock 上游（假地址，播放器一定放不出来）
+    mock: bool,
     /// 哪个上游节点给的
     provider: String,
     /// 命中层级：l1 / l2 / upstream
@@ -678,6 +680,12 @@ async fn respond(
         state.stats.downgraded.fetch_add(1, Ordering::Relaxed);
     }
 
+    // 直链是不是 mock 造的假地址（给客户端一个明确信号，别让它傻试）
+    let mock = state
+        .upstreams
+        .iter()
+        .any(|upstream| upstream.is_mock() && upstream.name() == resolved.url.provider.as_str());
+
     access_log(
         200,
         resolved.source,
@@ -695,6 +703,7 @@ async fn respond(
             quality: resolved.url.quality.clone(),
             requested_quality: quality.to_string(),
             downgraded,
+            mock,
             provider: resolved.url.provider,
             cache: resolved.layer,
             coalesced: resolved.coalesced,
@@ -743,6 +752,11 @@ async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
         "status": status,
         "l2": state.l2.is_enabled(),
         "adapters": state.upstreams.len(),
+        "mock_upstreams": state
+            .upstreams
+            .iter()
+            .filter(|upstream| upstream.is_mock())
+            .count(),
         "platforms": platforms,
         "missing_platforms": missing,
     }))
@@ -991,6 +1005,12 @@ async fn main() -> Result<(), BoxError> {
 
     // 启动自检：tx/kg/kw/wy/mg 五平台的适配器矩阵（STARTUP_PROBE=1 时再并发真打一发）
     startup_health_check(&state).await;
+
+    // 预热：每个适配器后台打一发，把 DNS + TLS 提前握好（不阻塞启动，失败也无所谓）
+    for upstream in state.upstreams.iter() {
+        let upstream = Arc::clone(upstream);
+        tokio::spawn(async move { upstream.warm_up().await });
+    }
 
     let app = Router::new()
         .route("/api/parse", get(parse_handler))
@@ -1561,5 +1581,48 @@ mod tests {
             assert!(ok, "{source} 应该至少有适配器在服务");
         }
         assert_eq!(matrix.get("tx").and_then(|entry| entry.get("adapters")).map(|v| v.as_array().map(|a| a.len()).unwrap_or(0)), Some(2));
+    }
+
+    #[tokio::test]
+    async fn response_marks_mock_upstreams() {
+        let upstreams: Vec<Arc<dyn Upstream>> =
+            vec![Arc::new(MockUpstream::new("upstream-a", 0).without_failures())];
+        let state = state_with(upstreams);
+
+        let payload = respond(&state, "kw", "mock-flag-1", "320k", &ParseOptions::default())
+            .await
+            .expect("mock 也要能正常返回");
+
+        assert!(payload.0.data.mock, "mock 直链必须在响应里标出来");
+        assert!(payload.0.data.url.contains("lx-mock.example"));
+    }
+
+    #[tokio::test]
+    async fn real_upstream_is_not_marked_as_mock() {
+        let upstreams: Vec<Arc<dyn Upstream>> = vec![Arc::new(FakeUpstream::new("qq").only_for("tx"))];
+        let state = state_with(upstreams);
+
+        let payload = respond(&state, "tx", "mock-flag-2", "320k", &ParseOptions::default())
+            .await
+            .expect("真实适配器");
+
+        assert!(!payload.0.data.mock, "真实适配器不能被标成 mock");
+    }
+
+    #[tokio::test]
+    async fn health_counts_mock_upstreams() {
+        let upstreams: Vec<Arc<dyn Upstream>> = vec![
+            Arc::new(MockUpstream::new("upstream-a", 0).without_failures()),
+            Arc::new(FakeUpstream::new("qq").only_for("tx")),
+        ];
+        let state = state_with(upstreams);
+
+        let response = health_handler(State(state)).await.into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let text = String::from_utf8(body.to_vec()).expect("utf8");
+
+        assert!(text.contains("\"mock_upstreams\":1"), "实际: {text}");
     }
 }

@@ -54,6 +54,10 @@ impl Upstream for MockUpstream {
         true
     }
 
+    fn is_mock(&self) -> bool {
+        true
+    }
+
     async fn resolve(&self, req: &TrackRequest) -> Result<SourceUrl, UpstreamError> {
         let jitter = pseudo_random() % 120;
         tokio::time::sleep(Duration::from_millis(self.base_latency_ms + jitter)).await;

@@ -92,6 +92,16 @@ impl Upstream for NodeUpstream {
         true
     }
 
+    async fn warm_up(&self) {
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            crate::http::client()
+                .get(self.base.trim_end_matches('/'))
+                .send(),
+        )
+        .await;
+    }
+
     async fn resolve(&self, req: &TrackRequest) -> Result<SourceUrl, UpstreamError> {
         let (endpoint, use_query) = self.endpoint(req);
 

@@ -148,6 +148,18 @@ impl Upstream for QqUpstream {
         }
     }
 
+    async fn warm_up(&self) {
+        // 打一发 GET 把 DNS + TLS 提前握手好，之后的 vkey 请求直接复用连接
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            crate::http::client()
+                .get(self.endpoint.as_str())
+                .header(reqwest::header::REFERER, "https://y.qq.com/")
+                .send(),
+        )
+        .await;
+    }
+
     async fn resolve(&self, req: &TrackRequest) -> Result<SourceUrl, UpstreamError> {
         let mid = req.music_id.trim();
         // songmid 是十几位大小写字母数字；kw 的纯数字 rid 打过来会被这里拦下

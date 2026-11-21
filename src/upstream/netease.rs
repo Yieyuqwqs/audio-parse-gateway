@@ -100,6 +100,17 @@ impl Upstream for NeteaseUpstream {
         }
     }
 
+    async fn warm_up(&self) {
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            crate::http::client()
+                .get(format!("{}/", self.base.trim_end_matches('/')))
+                .header(reqwest::header::REFERER, "https://music.163.com/")
+                .send(),
+        )
+        .await;
+    }
+
     async fn resolve(&self, req: &TrackRequest) -> Result<SourceUrl, UpstreamError> {
         let bitrate = Self::bitrate_for(req.quality).ok_or_else(|| UpstreamError::Unsupported {
             upstream: self.name.clone(),

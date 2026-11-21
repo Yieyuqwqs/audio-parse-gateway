@@ -297,6 +297,34 @@ curl -s 'http://127.0.0.1:8080/health'
 * 开机自启：装 `termux-boot` 后 `install.sh` 会写好 `~/.termux/boot/start-audio-gateway`；
 * 凭据放在 `~/audio-parse-gateway/.env`（0600），参考 `termux/env.example`。
 
+### `mock` 标记（判断直链真假）
+
+没有真实上游时，网关会起两个进程内 mock，返回 `*.lx-mock.example` 的**假直链**。
+现在这条信息会显式暴露出来：
+
+```json
+{
+  "code": 0,
+  "data": {
+    "url": "https://cdn-upstream-a.lx-mock.example/kw/320k/123.flac",
+    "provider": "upstream-a",
+    "mock": true,
+    "quality": "320k", "requested_quality": "320k", "downgraded": false
+  }
+}
+```
+
+* 响应里的 `mock: true` → 这条链是假的，客户端应该直接报错而不是去播放；
+* `GET /health` 里的 `mock_upstreams` 是 mock 适配器数量，>0 说明还没接真实音源；
+* `examples/lx-source.js` 已经会检查 `data.mock` 并给出人话错误。
+
+### 网络超时与预热（手机网络实测）
+
+* `CONNECT_TIMEOUT = 450ms` 是**含 TLS 握手**的：实测手机到 `u.y.qq.com` TCP ~65ms、TLS 累计 190~220ms，
+  原来设 200ms 会卡在边界上随机 `error sending request`；
+* 启动后会对每个适配器后台 `warm_up()` 打一发，把 DNS + TLS 提前握好，
+  第一发真实请求也走连接池；配 `http2` keep-alive 后稳态不再重复握手。
+
 ### 排障：LX 显示「换源失败」
 
 九成是**网关没有真实上游**，返回了 mock 假直链。先看启动日志有没有这一行：
