@@ -35,12 +35,20 @@ jobs:
           # 主力产物：glibc 动态链接，ubuntu/debian 直接跑
           - target: x86_64-unknown-linux-gnu
             experimental: false
+            android: false
           # 静态链接：拷到任何 Linux（alpine 也行）都能跑
           - target: x86_64-unknown-linux-musl
             experimental: true
+            android: false
           # ARM64 服务器（云厂商的 Ampere/Graviton 之类）
           - target: aarch64-unknown-linux-gnu
             experimental: true
+            android: false
+          # Android / Termux（arm64）：Termux 是 bionic libc，没有 glibc，
+          # 只有 NDK 编出来的这个能直接跑
+          - target: aarch64-linux-android
+            experimental: true
+            android: true
 
     # experimental 的目标挂了不会把整个 workflow 带红，也不会挡住 gnu 产物
     continue-on-error: ${{ matrix.experimental }}
@@ -52,6 +60,19 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      - name: Install Android NDK (termux 专用产物)
+        if: matrix.android
+        run: |
+          set -euo pipefail
+          # pinned，避免 latest 被下架导致 workflow 红
+          NDK_VERSION="r27c"
+          NDK_ZIP="android-ndk-${NDK_VERSION}-linux.zip"
+          curl -fsSL --retry 3 -o "/tmp/${NDK_ZIP}" "https://dl.google.com/android/repository/${NDK_ZIP}"
+          sudo mkdir -p /opt/android-ndk
+          sudo unzip -q "/tmp/${NDK_ZIP}" -d /opt/android-ndk
+          echo "ANDROID_NDK_HOME=/opt/android-ndk/android-ndk-${NDK_VERSION}" >> "$GITHUB_ENV"
+          ls "/opt/android-ndk/android-ndk-${NDK_VERSION}/toolchains/llvm/prebuilt/linux-x86_64/bin" | head -5
 
       - name: Cache cargo registry & target
         uses: Swatinem/rust-cache@v2
@@ -65,10 +86,21 @@ jobs:
           sudo apt-get install -y musl-tools
 
       - name: Install aarch64 cross linker
-        if: contains(matrix.target, 'aarch64')
+        if: contains(matrix.target, 'aarch64') && !matrix.android
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Configure Android NDK linker
+        if: matrix.android
+        run: |
+          set -euo pipefail
+          TOOLCHAIN="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=${TOOLCHAIN}/aarch64-linux-android24-clang" >> "$GITHUB_ENV"
+          # ring / 任何 C 依赖都走 NDK clang
+          echo "CC_aarch64_linux_android=${TOOLCHAIN}/aarch64-linux-android24-clang" >> "$GITHUB_ENV"
+          echo "AR_aarch64_linux_android=${TOOLCHAIN}/llvm-ar" >> "$GITHUB_ENV"
+          echo "PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1" >> "$GITHUB_ENV"
 
       - name: cargo build (release)
         run: cargo build --release --target ${{ matrix.target }}
@@ -86,6 +118,10 @@ jobs:
           mkdir -p "dist/${NAME}"
           cp "target/${{ matrix.target }}/release/${BIN}" "dist/${NAME}/"
           cp README.md "dist/${NAME}/"
+          if [ "${{ matrix.android }}" = "true" ]; then
+            # Termux 用户直接拷走就能用
+            cp termux/install.sh "dist/${NAME}/" 2>/dev/null || true
+          fi
           tar -C dist -czf "dist/${NAME}.tar.gz" "${NAME}"
           (
             cd dist
