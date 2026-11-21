@@ -239,6 +239,27 @@ cargo test
 过载 503、Prometheus 文本、参数校验、**音质协商与降档**（天花板筛选 / 静默降级如实上报 / 降档指标 / QQ 多档候选取最优），以及 **Redis L2 命中**（只认 `REDIS_URL`，本地没起 redis 就自动跳过）。
 CI 里 `cargo build --release`、`cargo test`、`cargo clippy` 都会跑，并且带一个 `redis:7-alpine` service 给 L2 用例用。
 
+## 下载 / 发布
+
+二进制由 `Release` workflow 打（`.github/workflows/release.yml`），CI 只负责 build+test，不打产物：
+
+| 触发方式 | 结果 |
+| --- | --- |
+| 打 tag：`git tag v0.1.0 && git push origin v0.1.0` | 三个平台的 `tar.gz` + `sha256` 自动挂到 **GitHub Release** |
+| Actions → Release → **Run workflow** | 只打包，产物在本次 run 的 **Artifacts** 里（保留 30 天） |
+
+产物命名：`audio-parse-gateway-<target>.tar.gz`（内含二进制 + README），旁边配 `.tar.gz.sha256`。
+
+| target | 说明 |
+| --- | --- |
+| `x86_64-unknown-linux-gnu` | 主力产物：glibc 动态链接，Ubuntu/Debian 直接跑 |
+| `x86_64-unknown-linux-musl` | 静态链接，拷到任何 Linux 都能跑（alpine 也行） |
+| `aarch64-unknown-linux-gnu` | ARM64 服务器（Graviton / Ampere 之类） |
+
+后两个在矩阵里标了 `experimental`：挂了不会挡住 gnu 产物，也不会把 workflow 带红，
+去 run 日志里看缺哪个交叉工具链即可。`ring`（rustls 的加密实现）交叉编译时需要把 `CC` 指对，
+workflow 里已经配了 `musl-gcc` / `aarch64-linux-gnu-gcc`。
+
 ## 部署
 
 ```bash
