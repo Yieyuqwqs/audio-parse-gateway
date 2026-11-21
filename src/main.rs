@@ -1068,9 +1068,10 @@ mod tests {
         let upstreams: Vec<Arc<dyn Upstream>> =
             vec![Arc::new(FakeUpstream::new("lossy-m").with_ceiling("320k"))];
         let state = state_with(upstreams);
-        respond(&state, "wy", "quality-metric-1", "flac")
+        let payload = respond(&state, "wy", "quality-metric-1", "flac")
             .await
             .expect("降档请求");
+        assert!(payload.0.data.downgraded, "这一发本来就该降档");
 
         let response = metrics_handler(State(state)).await.into_response();
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
