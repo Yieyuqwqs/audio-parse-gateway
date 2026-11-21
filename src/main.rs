@@ -19,7 +19,8 @@
 //! 6. 路由：`GET /api/parse?id=<musicId>[&source=kw][&quality=320k]`、`GET /url/{source}/{musicId}`。
 //!   还有 `GET /metrics`（Prometheus 文本格式）与 `GET /health`。
 //!
-//! 启动：`cargo run --release`（默认监听 0.0.0.0:8080，自动起两个 mock 上游；REDIS_URL 可选）
+//! 启动：`cargo run --release`（默认监听 0.0.0.0:8080；没配真实上游时自动起两个 mock）
+//! 接真实音源：`UPSTREAM_A_URL=https://node.example.com cargo run --release`，或 `ENABLE_NETEASE=1` 直连网易云；`REDIS_URL` 可选
 //! 自测：`curl 'http://127.0.0.1:8080/api/parse?id=123456&source=kw&quality=320k'`
 
 use std::{
@@ -47,6 +48,11 @@ use tokio::sync::{Mutex, Semaphore};
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
+mod http;
+mod upstream;
+
+use upstream::{MockUpstream, NeteaseUpstream, NodeUpstream, TrackRequest, Upstream, UpstreamError};
+
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 // ---------------------------------------------------------------------------
@@ -57,16 +63,6 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 const UPSTREAM_TIMEOUT: Duration = Duration::from_millis(800);
 /// 竞速整体的硬上限（兜底，比单请求超时略宽，避免误杀“刚好在 800ms 返回”的赢家）
 const RACE_DEADLINE: Duration = Duration::from_millis(850);
-/// 建连超时：连不上的上游要尽快失败，把额度让给别的上游
-const CONNECT_TIMEOUT: Duration = Duration::from_millis(300);
-
-/// 每个 host 最多保留的空闲长连接数（需求 1）
-const POOL_MAX_IDLE_PER_HOST: usize = 100;
-/// 空闲连接回收时间，略小于常见 LB / NAT 的空闲踢断时间
-const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
-/// TCP keep-alive 探测间隔
-const TCP_KEEPALIVE: Duration = Duration::from_secs(60);
-
 /// 同时在飞的上游请求上限（背压 / 过载保护）
 const UPSTREAM_MAX_INFLIGHT: usize = 2_000;
 
@@ -92,35 +88,6 @@ const DEFAULT_QUALITY: &str = "320k";
 const SUPPORTED_SOURCES: [&str; 6] = ["kw", "kg", "tx", "wy", "mg", "local"];
 /// LX 支持的音质
 const SUPPORTED_QUALITIES: [&str; 4] = ["128k", "320k", "flac", "flac24bit"];
-
-// ---------------------------------------------------------------------------
-// 1. 全局 HTTP 连接池（once_cell 单例，进程内唯一）
-// ---------------------------------------------------------------------------
-
-/// 全局唯一的上游 HTTP 客户端。
-///
-/// * `pool_max_idle_per_host(100)`：每个上游 host 最多缓存 100 条空闲长连接，
-///   高并发时直接复用 TCP/TLS，省掉握手 RTT（这是「低延迟」的最大来源）。
-/// * `tcp_keepalive(60s)`：内核定期发探测包，及时发现被中间设备静默掐断的死连接，
-///   避免把请求发进「看起来还活着」的黑洞里。
-/// * `tcp_nodelay(true)`：关闭 Nagle，杜绝小包攒批带来的额外延迟。
-/// * `connect_timeout(300ms)`：建连慢的上游早点死，把 800ms 预算留给能干活的那路。
-///
-/// 注意：这里的 `Lazy` 是**进程级单例**，所有请求共享同一个连接池；
-/// 千万不要在 handler 里 `Client::new()`，那会把连接池弄废（每次新握手）。
-static HTTP_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
-    reqwest::Client::builder()
-        .pool_max_idle_per_host(POOL_MAX_IDLE_PER_HOST)
-        .pool_idle_timeout(POOL_IDLE_TIMEOUT)
-        .tcp_keepalive(TCP_KEEPALIVE)
-        .tcp_nodelay(true)
-        .connect_timeout(CONNECT_TIMEOUT)
-        // 兜底超时：真正生效的 SLO 是下面 tokio::time::timeout(800ms)
-        .timeout(Duration::from_millis(1_500))
-        .user_agent(concat!("lx-parse-gateway/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .expect("failed to build the global reqwest client")
-});
 
 // ---------------------------------------------------------------------------
 // 2.1 L1 缓存：moka 无锁并发内存缓存
@@ -162,12 +129,12 @@ impl SourceUrl {
     ///
     /// 音源直链通常带签名且 10~30 分钟过期，缓存命中后仍要校验一次，
     /// 否则会把「死链」返回给播放器（表现为播放器转圈/秒退）。
-    fn is_fresh(&self) -> bool {
+    pub(crate) fn is_fresh(&self) -> bool {
         self.expires_at == 0 || self.expires_at > now_unix()
     }
 }
 
-fn now_unix() -> u64 {
+pub(crate) fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -186,6 +153,18 @@ enum AppError {
     Upstream(String),
     #[error("gateway is shedding load, please retry later")]
     Overloaded,
+}
+
+impl From<UpstreamError> for AppError {
+    /// 适配层错误 → 对外 HTTP 语义：
+    /// 超时 504、网络故障 502、其余（无直链 / 脏响应 / 没有可用上游）一律 502 并透出原因。
+    fn from(err: UpstreamError) -> Self {
+        match err {
+            UpstreamError::Timeout { .. } => AppError::Timeout(UPSTREAM_TIMEOUT),
+            UpstreamError::Transport { source, .. } => AppError::Http(source),
+            other => AppError::Upstream(other.to_string()),
+        }
+    }
 }
 
 impl IntoResponse for AppError {
@@ -317,6 +296,8 @@ struct L2State {
 struct L2Cache {
     url: String,
     state: Mutex<L2State>,
+    /// false = 显式关闭（单元测试 / 纯 L1 部署），连 redis 都不尝试
+    enabled: bool,
 }
 
 impl L2Cache {
@@ -325,11 +306,24 @@ impl L2Cache {
         Self {
             url,
             state: Mutex::new(L2State { conn: None, next_retry_at: Instant::now() }),
+            enabled: true,
+        }
+    }
+
+    /// 显式关闭 L2：测试里不想连 redis 时用，读路径直接当未命中。
+    fn disabled() -> Self {
+        Self {
+            url: String::new(),
+            state: Mutex::new(L2State { conn: None, next_retry_at: Instant::now() }),
+            enabled: false,
         }
     }
 
     /// 取一个可克隆的连接句柄；拿不到就返回 `None`（= 优雅降级）。
     async fn connection(&self) -> Option<redis::aio::ConnectionManager> {
+        if !self.enabled {
+            return None;
+        }
         let mut state = self.state.lock().await;
 
         if let Some(conn) = state.conn.as_ref() {
@@ -481,8 +475,8 @@ impl SingleFlight {
 
 #[derive(Clone)]
 struct AppState {
-    /// 上游节点池（两个 mock，可通过环境变量换成真实音源节点）
-    upstreams: Arc<Vec<String>>,
+    /// 上游适配器注册表：节点 / 直连源 / mock 都实现同一个 `Upstream` trait
+    upstreams: Arc<Vec<Arc<dyn Upstream>>>,
     l2: Arc<L2Cache>,
     flight: Arc<SingleFlight>,
     /// 上游并发闸门：过载时直接 503，保护自己也不压垮上游
@@ -507,7 +501,8 @@ impl AppState {
         music_id: &str,
         quality: &'static str,
     ) -> Result<Resolved, AppError> {
-        let key = format!("{source}:{music_id}:{quality}");
+        // 缓存 key 与适配层共用同一套拼法，避免两处漂移
+        let key = TrackRequest::new(source, music_id, quality).cache_key();
 
         // ---- 1) L1 / L2：绝大多数请求在这里结束，纯内存、无锁读 ----
         if let Some(hit) = self.cache_lookup(&key).await {
@@ -566,11 +561,13 @@ impl AppState {
         // 过载保护：拿不到令牌就快速失败，而不是把请求堆在队列里拖垮自己
         let permit = self.limiter.try_acquire().map_err(|_| AppError::Overloaded)?;
 
-        let url = match race_upstreams(&self.upstreams, source, music_id, quality).await {
+        let request = TrackRequest::new(source, music_id, quality);
+        let url = match upstream::race(&self.upstreams, &request, RACE_DEADLINE).await {
             Ok(url) => url,
             Err(err) => {
                 self.stats.errors.fetch_add(1, Ordering::Relaxed);
-                return Err(err);
+                warn!(upstream = err.upstream(), error = %err, "upstream race failed");
+                return Err(AppError::from(err));
             }
         };
         drop(permit);
@@ -626,108 +623,10 @@ impl AppState {
 
 // ---------------------------------------------------------------------------
 // 3 + 4. 竞速 + 超时
+//
+// 实现已经收敛到 `upstream::race`：每个适配器自带 800ms 硬超时（包住「发送 + 读 body」），
+// 竞速整体 850ms 兜底，赢家返回后其余任务立即 abort —— 真取消，不浪费上游配额。
 // ---------------------------------------------------------------------------
-
-/// 同时请求所有上游节点，**谁先成功用谁**。
-///
-/// * 用 `tokio::task::JoinSet` 把每路上游变成独立 task（各自跑在自己的 waker 上，
-///   互不干扰，也不会因为某一路 panic 拖垮整条请求）；
-/// * 用 `tokio::select!` 等「第一个完成的任务」；拿到赢家后 `JoinSet` 被 drop，
-///   其余任务立刻 `abort()` —— 这就是「另一个直接取消」，省掉多余的带宽与上游配额；
-/// * 另有一路 `sleep(RACE_DEADLINE)` 作为整体硬上限，防止某个任务自身的超时失效。
-async fn race_upstreams(
-    upstreams: &[String],
-    source: &'static str,
-    music_id: &str,
-    quality: &'static str,
-) -> Result<SourceUrl, AppError> {
-    if upstreams.is_empty() {
-        return Err(AppError::Upstream("no upstream configured".to_string()));
-    }
-
-    let mut tasks = tokio::task::JoinSet::new();
-    for base in upstreams {
-        let base = base.clone();
-        let music_id = music_id.to_string();
-        tasks.spawn(async move { fetch_upstream(&base, source, &music_id, quality).await });
-    }
-
-    let mut deadline = Box::pin(tokio::time::sleep(RACE_DEADLINE));
-    let mut last_error: Option<AppError> = None;
-
-    loop {
-        let joined = tokio::select! {
-            // 先完成的那一路（成功或失败）
-            biased;
-            joined = tasks.join_next() => joined,
-            // 整体兜底：即使每个 task 的超时都没生效，也不会超过 850ms
-            _ = &mut deadline => {
-                warn!(source, music_id, "upstream race hit the overall deadline");
-                break;
-            }
-        };
-
-        let Some(joined) = joined else {
-            break; // 所有上游都已结束且都失败了
-        };
-
-        match joined {
-            // 赢家：函数返回 → tasks(JoinSet) 被 drop → 其余上游 task 全部 abort
-            Ok(Ok(url)) => return Ok(url),
-            Ok(Err(err)) => {
-                warn!(error = %err, "one upstream failed, still waiting for the other");
-                last_error = Some(err);
-            }
-            Err(join_error) => {
-                warn!(error = %join_error, "upstream task panicked or was aborted");
-                last_error = Some(AppError::Upstream(format!("task failure: {join_error}")));
-            }
-        }
-    }
-
-    Err(last_error.unwrap_or(AppError::Timeout(RACE_DEADLINE)))
-}
-
-/// 单路上游请求：**所有上游请求强制 800ms 超时**（需求 3）。
-async fn fetch_upstream(
-    base: &str,
-    source: &'static str,
-    music_id: &str,
-    quality: &'static str,
-) -> Result<SourceUrl, AppError> {
-    let started = Instant::now();
-    let path = format!("{base}/api/url");
-
-    // 注意：超时包住「发送 + 读 body」，而不是只包住 send()，
-    // 否则慢 body 会绕过 800ms 限制（典型的线上事故）。
-    let request = async {
-        let response = HTTP_CLIENT
-            .get(path.as_str())
-            .query(&[("source", source), ("id", music_id), ("quality", quality)])
-            .send()
-            .await?;
-
-        let status = response.status();
-        if !status.is_success() {
-            return Err(AppError::Upstream(format!("{path} returned HTTP {status}")));
-        }
-
-        let url: SourceUrl = response.json().await?;
-        Ok::<SourceUrl, AppError>(url)
-    };
-
-    let url = tokio::time::timeout(UPSTREAM_TIMEOUT, request)
-        .await
-        .map_err(|_| AppError::Timeout(UPSTREAM_TIMEOUT))??;
-
-    debug!(
-        %path,
-        provider = %url.provider,
-        elapsed_ms = started.elapsed().as_millis() as u64,
-        "upstream answered"
-    );
-    Ok(url)
-}
 
 // ---------------------------------------------------------------------------
 // 6. 路由与 handler
@@ -894,85 +793,63 @@ fn validate_music_id(raw: Option<&str>) -> Result<&str, AppError> {
 }
 
 // ---------------------------------------------------------------------------
-// Mock 上游音源节点（演示用；真实环境把 UPSTREAM_A_URL / UPSTREAM_B_URL 指过去即可）
+// 上游适配器装配：环境变量 → 适配器注册表
 // ---------------------------------------------------------------------------
 
-#[derive(Clone)]
-struct MockUpstream {
-    provider: &'static str,
-    base_latency_ms: u64,
-}
+/// 从环境变量装配上游适配器。
+///
+/// | 环境变量 | 作用 |
+/// | --- | --- |
+/// | `UPSTREAM_A_URL` / `UPSTREAM_B_URL` | 解析节点地址（不配就跳过这一路） |
+/// | `UPSTREAM_A_PATH` / `UPSTREAM_B_PATH` | 节点路径，默认 `/api/url`，支持 `{source}` `{id}` `{quality}` 模板 |
+/// | `UPSTREAM_A_TOKEN` / `UPSTREAM_B_TOKEN` | 节点鉴权：`Authorization: Bearer <token>` |
+/// | `ENABLE_NETEASE=1` | 打开网易云直连适配器（真实音源，源 `wy`） |
+/// | `NETEASE_COOKIE` | 网易云登录 cookie，带上才能解锁 320k / flac |
+///
+/// 一个真实上游都没配 → 自动起两个进程内 mock，保证 `cargo run` 就能跑通全链路。
+fn build_upstreams() -> Arc<Vec<Arc<dyn Upstream>>> {
+    let mut upstreams: Vec<Arc<dyn Upstream>> = Vec::new();
 
-#[derive(Debug, Deserialize)]
-struct MockResolveQuery {
-    id: String,
-    #[serde(default)]
-    source: String,
-    #[serde(default)]
-    quality: String,
-}
+    for (url_var, path_var, token_var, name) in [
+        ("UPSTREAM_A_URL", "UPSTREAM_A_PATH", "UPSTREAM_A_TOKEN", "node-a"),
+        ("UPSTREAM_B_URL", "UPSTREAM_B_PATH", "UPSTREAM_B_TOKEN", "node-b"),
+    ] {
+        let Ok(base) = std::env::var(url_var) else { continue };
+        if base.trim().is_empty() {
+            continue;
+        }
 
-async fn mock_resolve_handler(
-    State(cfg): State<MockUpstream>,
-    Query(query): Query<MockResolveQuery>,
-) -> Response {
-    // 模拟网络抖动：基础延迟 + 0..120ms 随机抖动
-    let jitter = pseudo_random() % 120;
-    tokio::time::sleep(Duration::from_millis(cfg.base_latency_ms + jitter)).await;
-
-    // 3% 概率故意失败，用来验证「竞速 + 失败切换」逻辑是否生效
-    if pseudo_random() % 100 < 3 {
-        return (StatusCode::INTERNAL_SERVER_ERROR, "mock upstream exploded").into_response();
+        let mut node = NodeUpstream::new(name, base, UPSTREAM_TIMEOUT);
+        if let Ok(path) = std::env::var(path_var) {
+            if !path.trim().is_empty() {
+                node = node.with_path(path);
+            }
+        }
+        if let Ok(token) = std::env::var(token_var) {
+            node = node.with_token(Some(token));
+        }
+        info!(upstream = name, "解析节点适配器已注册");
+        upstreams.push(Arc::new(node));
     }
 
-    let body = SourceUrl {
-        url: format!(
-            "https://cdn-{}.lx-mock.example/{}/{}/{}.flac",
-            cfg.provider, query.source, query.quality, query.id
-        ),
-        provider: cfg.provider.to_string(),
-        quality: query.quality,
-        // 直链 10 分钟后过期，比缓存 TTL 短 → 用来演示 is_fresh() 的二次校验
-        expires_at: now_unix() + 600,
-    };
-    Json(body).into_response()
-}
-
-/// 起一个进程内的 mock 上游，返回 base url（监听 127.0.0.1 的随机端口）
-async fn spawn_mock_upstream(provider: &'static str, base_latency_ms: u64) -> Result<String, BoxError> {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-    let addr = listener.local_addr()?;
-
-    let app = Router::new()
-        .route("/api/url", get(mock_resolve_handler))
-        .with_state(MockUpstream { provider, base_latency_ms });
-
-    tokio::spawn(async move {
-        if let Err(err) = axum::serve(listener, app).await {
-            warn!(error = %err, provider, "mock upstream stopped");
-        }
-    });
-
-    info!(%addr, provider, base_latency_ms, "mock upstream started");
-    Ok(format!("http://{addr}"))
-}
-
-/// 轻量无锁随机数（xorshift64），只用于 mock 抖动，不需要密码学强度。
-fn pseudo_random() -> u64 {
-    static SEED: AtomicU64 = AtomicU64::new(0x2545_F491_4F6C_DD1D);
-    loop {
-        let current = SEED.load(Ordering::Relaxed);
-        let mut next = current;
-        next ^= next << 13;
-        next ^= next >> 7;
-        next ^= next << 17;
-        if SEED
-            .compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
-        {
-            return next;
-        }
+    let netease_enabled = std::env::var("ENABLE_NETEASE")
+        .map(|value| !value.is_empty() && value != "0")
+        .unwrap_or(false);
+    if netease_enabled {
+        let cookie = std::env::var("NETEASE_COOKIE").ok();
+        upstreams.push(Arc::new(
+            NeteaseUpstream::new(UPSTREAM_TIMEOUT).with_cookie(cookie),
+        ));
+        info!("网易云直连适配器已注册（源 wy）");
     }
+
+    if upstreams.is_empty() {
+        warn!("未配置真实上游，回退到两个进程内 mock（配 UPSTREAM_A_URL 或 ENABLE_NETEASE=1 即可接真实音源）");
+        upstreams.push(Arc::new(MockUpstream::new("upstream-a", 80)));
+        upstreams.push(Arc::new(MockUpstream::new("upstream-b", 170)));
+    }
+
+    Arc::new(upstreams)
 }
 
 // ---------------------------------------------------------------------------
@@ -990,29 +867,26 @@ async fn main() -> Result<(), BoxError> {
         .compact()
         .init();
 
-    // 预热全局连接池（同时让任何配置错误在启动期就 panic，而不是首个请求时）
-    Lazy::force(&HTTP_CLIENT);
+    // 预热全局连接池（配置错在启动期就炸，而不是等第一个请求）
+    http::warm_up();
     info!(
-        max_idle_per_host = POOL_MAX_IDLE_PER_HOST,
+        max_idle_per_host = http::POOL_MAX_IDLE_PER_HOST,
         ttl_secs = L1_TTL.as_secs(),
         "global http pool & L1 cache warmed up"
     );
 
-    // 上游节点：默认起两个 mock；生产环境用环境变量指向真实音源
-    let upstream_a = match std::env::var("UPSTREAM_A_URL") {
-        Ok(url) => url,
-        Err(_) => spawn_mock_upstream("upstream-a", 80).await?,
-    };
-    let upstream_b = match std::env::var("UPSTREAM_B_URL") {
-        Ok(url) => url,
-        Err(_) => spawn_mock_upstream("upstream-b", 170).await?,
-    };
+    // 上游适配器注册表：配了真实音源就用真的，一个都没配就起两个 mock
+    let upstreams = build_upstreams();
+    info!(
+        adapters = ?upstreams.iter().map(|upstream| upstream.name()).collect::<Vec<_>>(),
+        "upstream adapters registered"
+    );
 
     let redis_url = std::env::var("REDIS_URL")
         .unwrap_or_else(|_| "redis://127.0.0.1:6379/".to_string());
 
     let state = AppState {
-        upstreams: Arc::new(vec![upstream_a.clone(), upstream_b.clone()]),
+        upstreams,
         l2: Arc::new(L2Cache::new(redis_url)),
         flight: Arc::new(SingleFlight::default()),
         limiter: Arc::new(Semaphore::new(UPSTREAM_MAX_INFLIGHT)),
@@ -1031,7 +905,6 @@ async fn main() -> Result<(), BoxError> {
         .parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
 
-    info!(%upstream_a, %upstream_b, "upstreams ready");
     info!("LX parse gateway listening on http://{addr}");
 
     axum::serve(listener, app)
@@ -1067,4 +940,273 @@ async fn shutdown_signal() {
     }
 
     info!("shutdown signal received, draining in-flight requests…");
+}
+
+// ---------------------------------------------------------------------------
+// 单元测试：适配层错误语义 + 竞速 + singleflight + 缓存 + 参数校验
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    /// 可编程的假适配器：能配延迟、强制失败、只支持某个音源。
+    #[derive(Debug)]
+    struct FakeUpstream {
+        name: &'static str,
+        delay: Duration,
+        fails: bool,
+        only: Option<&'static str>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl FakeUpstream {
+        fn new(name: &'static str) -> Self {
+            Self {
+                name,
+                delay: Duration::ZERO,
+                fails: false,
+                only: None,
+                calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn with_delay(mut self, delay: Duration) -> Self {
+            self.delay = delay;
+            self
+        }
+
+        fn failing(mut self) -> Self {
+            self.fails = true;
+            self
+        }
+
+        fn only_for(mut self, source: &'static str) -> Self {
+            self.only = Some(source);
+            self
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Upstream for FakeUpstream {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn supports(&self, source: &str) -> bool {
+            self.only.map_or(true, |only| only == source)
+        }
+
+        async fn resolve(&self, req: &TrackRequest) -> Result<SourceUrl, UpstreamError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if !self.delay.is_zero() {
+                tokio::time::sleep(self.delay).await;
+            }
+            if self.fails {
+                return Err(UpstreamError::Status {
+                    upstream: self.name.to_string(),
+                    status: StatusCode::BAD_GATEWAY,
+                });
+            }
+            Ok(SourceUrl {
+                url: format!(
+                    "https://cdn.example/{}/{}/{}.mp3",
+                    self.name, req.source, req.music_id
+                ),
+                provider: self.name.to_string(),
+                quality: req.quality.to_string(),
+                expires_at: now_unix() + 600,
+            })
+        }
+    }
+
+    fn state_with(upstreams: Vec<Arc<dyn Upstream>>) -> AppState {
+        AppState {
+            upstreams: Arc::new(upstreams),
+            l2: Arc::new(L2Cache::disabled()),
+            flight: Arc::new(SingleFlight::default()),
+            limiter: Arc::new(Semaphore::new(64)),
+            stats: Arc::new(Stats::default()),
+        }
+    }
+
+    #[tokio::test]
+    async fn race_keeps_the_fastest_winner() {
+        let upstreams: Vec<Arc<dyn Upstream>> = vec![
+            Arc::new(FakeUpstream::new("slow").with_delay(Duration::from_millis(300))),
+            Arc::new(FakeUpstream::new("fast").with_delay(Duration::from_millis(5))),
+        ];
+        let resolved = state_with(upstreams)
+            .resolve("kw", "race-fast-1", "320k")
+            .await
+            .expect("最快的那一路应该赢");
+        assert_eq!(resolved.url.provider, "fast");
+        assert_eq!(resolved.layer, "upstream");
+    }
+
+    #[tokio::test]
+    async fn race_fails_over_to_a_healthy_upstream() {
+        let upstreams: Vec<Arc<dyn Upstream>> = vec![
+            Arc::new(FakeUpstream::new("broken").failing()),
+            Arc::new(FakeUpstream::new("healthy").with_delay(Duration::from_millis(10))),
+        ];
+        let resolved = state_with(upstreams)
+            .resolve("kw", "race-failover-1", "320k")
+            .await
+            .expect("一路失败不应影响整体");
+        assert_eq!(resolved.url.provider, "healthy");
+    }
+
+    #[tokio::test]
+    async fn all_upstreams_failing_maps_to_502() {
+        let upstreams: Vec<Arc<dyn Upstream>> = vec![Arc::new(FakeUpstream::new("a").failing())];
+        let err = state_with(upstreams)
+            .resolve("kw", "race-allfail-1", "320k")
+            .await
+            .unwrap_err();
+        assert_eq!(err.into_response().status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn source_without_candidate_is_rejected() {
+        let upstreams: Vec<Arc<dyn Upstream>> =
+            vec![Arc::new(FakeUpstream::new("wy-only").only_for("wy"))];
+        let err = state_with(upstreams)
+            .resolve("kw", "no-candidate-1", "320k")
+            .await
+            .unwrap_err();
+        assert_eq!(err.into_response().status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn upstream_errors_map_to_http_status() {
+        let timeout = AppError::from(UpstreamError::Timeout {
+            upstream: "node-a".to_string(),
+            after: UPSTREAM_TIMEOUT,
+        });
+        assert_eq!(timeout.into_response().status(), StatusCode::GATEWAY_TIMEOUT);
+
+        let no_url = AppError::from(UpstreamError::NoUrl {
+            upstream: "netease".to_string(),
+            detail: "no url".to_string(),
+        });
+        assert_eq!(no_url.into_response().status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn second_request_is_served_from_l1() {
+        let upstreams: Vec<Arc<dyn Upstream>> = vec![Arc::new(FakeUpstream::new("cache-a"))];
+        let state = state_with(upstreams);
+
+        let first = state.resolve("kw", "cache-hit-1", "320k").await.expect("首查");
+        assert_eq!(first.layer, "upstream");
+
+        let second = state.resolve("kw", "cache-hit-1", "320k").await.expect("二次命中");
+        assert_eq!(second.layer, "l1");
+        assert_eq!(second.url.url, first.url.url);
+    }
+
+    #[tokio::test]
+    async fn expired_signed_url_is_not_served() {
+        let upstreams: Vec<Arc<dyn Upstream>> = vec![Arc::new(FakeUpstream::new("exp-a"))];
+        let state = state_with(upstreams);
+
+        L1_CACHE
+            .insert(
+                "kw:expired-1:320k".to_string(),
+                Arc::new(SourceUrl {
+                    url: "https://dead.example/x.mp3".to_string(),
+                    provider: "dead".to_string(),
+                    quality: "320k".to_string(),
+                    expires_at: now_unix().saturating_sub(60),
+                }),
+            )
+            .await;
+
+        let resolved = state
+            .resolve("kw", "expired-1", "320k")
+            .await
+            .expect("过期条目应该重新解析");
+        assert_eq!(resolved.layer, "upstream");
+        assert_ne!(resolved.url.url, "https://dead.example/x.mp3");
+    }
+
+    #[tokio::test]
+    async fn singleflight_coalesces_concurrent_requests() {
+        let fake = FakeUpstream::new("slow").with_delay(Duration::from_millis(150));
+        let calls = Arc::clone(&fake.calls);
+        let upstreams: Vec<Arc<dyn Upstream>> = vec![Arc::new(fake)];
+        let state = Arc::new(state_with(upstreams));
+
+        let mut handles = Vec::new();
+        for _ in 0..6 {
+            let state = Arc::clone(&state);
+            handles.push(tokio::spawn(async move { state.resolve("kw", "flight-1", "320k").await }));
+        }
+
+        let mut coalesced = 0;
+        for handle in handles {
+            let resolved = handle.await.expect("task 不应 panic").expect("并发请求都应成功");
+            if resolved.coalesced {
+                coalesced += 1;
+            }
+        }
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "6 个并发请求只应打一次上游");
+        assert!(coalesced >= 1, "至少应有请求被 singleflight 合并");
+    }
+
+    #[tokio::test]
+    async fn overload_sheds_load_with_503() {
+        let upstreams: Vec<Arc<dyn Upstream>> = vec![Arc::new(FakeUpstream::new("limit-a"))];
+        let state = state_with(upstreams);
+
+        // 把 64 个上游并发令牌全部占满，下一个请求必须直接 503 而不是排队
+        let permits = Arc::clone(&state.limiter)
+            .acquire_many_owned(64)
+            .await
+            .expect("应该能拿到令牌");
+
+        let err = state.resolve("kw", "limit-1", "320k").await.unwrap_err();
+        assert_eq!(err.into_response().status(), StatusCode::SERVICE_UNAVAILABLE);
+        drop(permits);
+    }
+
+    #[tokio::test]
+    async fn metrics_exposes_prometheus_text() {
+        let upstreams: Vec<Arc<dyn Upstream>> = vec![Arc::new(FakeUpstream::new("m"))];
+        let state = state_with(upstreams);
+        state.resolve("kw", "metrics-1", "320k").await.expect("先打一发");
+
+        let response = metrics_handler(State(state)).await.into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let text = String::from_utf8(body.to_vec()).expect("utf8");
+
+        assert!(text.contains("lx_gateway_requests_total 1"), "实际输出:\n{text}");
+        assert!(text.contains(r#"lx_gateway_cache_hits_total{layer="l1"} 0"#));
+        assert!(text.contains("lx_gateway_upstream_requests_total 1"));
+    }
+
+    #[test]
+    fn normalises_source_and_quality() {
+        assert_eq!(normalize_source(Some("KW")).expect("大小写不敏感"), "kw");
+        assert_eq!(normalize_source(None).expect("默认源"), DEFAULT_SOURCE);
+        assert!(normalize_source(Some("bogus")).is_err());
+
+        assert_eq!(normalize_quality(Some(" FLAC ")).expect("去空格"), "flac");
+        assert_eq!(normalize_quality(Some("")).expect("空串走默认"), DEFAULT_QUALITY);
+        assert!(normalize_quality(Some("999k")).is_err());
+    }
+
+    #[test]
+    fn validates_music_id() {
+        assert_eq!(validate_music_id(Some(" abc123._:- ")).expect("合法 id"), "abc123._:-");
+        assert!(validate_music_id(None).is_err());
+        assert!(validate_music_id(Some("   ")).is_err());
+        assert!(validate_music_id(Some("a/b")).is_err(), "路径分隔符必须被拒绝");
+        assert!(validate_music_id(Some(&"x".repeat(129))).is_err());
+    }
 }

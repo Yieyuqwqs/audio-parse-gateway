@@ -101,6 +101,57 @@ send(EVENT_NAMES.inited, {
 })
 ```
 
+## 上游适配层（`src/upstream/`）
+
+网关只做编排，**怎么拿到一条直链**收敛在 `Upstream` trait 后面：
+
+```rust
+#[async_trait::async_trait]
+pub trait Upstream: Send + Sync + fmt::Debug {
+    fn name(&self) -> &str;
+    fn supports(&self, source: &str) -> bool;      // 竞速前先按音源过滤
+    async fn resolve(&self, req: &TrackRequest) -> Result<SourceUrl, UpstreamError>;
+}
+```
+
+现成三个实现：
+
+| 实现 | 文件 | 说明 |
+| --- | --- | --- |
+| `NodeUpstream` | `src/upstream/node.rs` | 通用 HTTP 解析节点：路径支持 `{source}` `{id}` `{quality}` 模板，可带 Bearer token；响应兼容 `{url}` / `{code:0,data:{url}}` / `{data:{url}}` / `{data:[{url}]}`，有效期字段 `expires_at` / `expi` / `expires` 都认 |
+| `NeteaseUpstream` | `src/upstream/netease.rs` | 网易云官方接口直连（源 `wy`）：音质 → 码率（128k/320k/flac），`expi` 写进 `expires_at`；付费/版权下架时接口返回 `url: null`，这里抛 `NoUrl` 让竞速换路，绝不把死链返回给播放器；带 `NETEASE_COOKIE` 才能拿 320k / flac |
+| `MockUpstream` | `src/upstream/mock.rs` | 进程内假上游：0~120ms 抖动 + 3% 失败率，本地就能验证竞速与失败切换；测试里可以关掉 |
+
+装配只看环境变量（`build_upstreams()`）：
+
+| 环境变量 | 作用 |
+| --- | --- |
+| `UPSTREAM_A_URL` / `UPSTREAM_B_URL` | 解析节点地址（不配就跳过这一路） |
+| `UPSTREAM_A_PATH` / `UPSTREAM_B_PATH` | 节点路径，默认 `/api/url`，支持 `{source}` `{id}` `{quality}` |
+| `UPSTREAM_A_TOKEN` / `UPSTREAM_B_TOKEN` | 节点鉴权：`Authorization: Bearer <token>` |
+| `ENABLE_NETEASE=1` | 打开网易云直连适配器 |
+| `NETEASE_COOKIE` | 网易云登录 cookie（解锁高音质） |
+
+```bash
+# 接自建节点 + 网易云直连
+UPSTREAM_A_URL=https://node-a.example.com ENABLE_NETEASE=1 cargo run --release
+# 只想本地跑通全链路：什么都不配，自动起两个 mock
+cargo run --release
+```
+
+新增一个音源 = 实现 `Upstream` + 在 `build_upstreams()` 里 `push` 一项，
+缓存 / singleflight / 竞速 / 指标这些主链路一行都不用改。
+
+## 测试
+
+```bash
+cargo test
+```
+
+覆盖：适配层错误分类与 HTTP 状态映射（504 / 502 / 503）、节点响应多形状解析、网易云音质→码率与空 url 判定、
+竞速取最快 / 失败切换 / 全挂 502、singleflight 合并（6 并发只打 1 次上游）、L1 命中、过期直链不返回、
+过载 503、Prometheus 文本、参数校验。CI 里 `cargo build --release`、`cargo test`、`cargo clippy` 都会跑。
+
 ## 关键参数（改 main.rs 顶部常量即可）
 
 | 常量 | 值 | 说明 |
