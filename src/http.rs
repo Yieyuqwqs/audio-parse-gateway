@@ -72,6 +72,27 @@ static STREAM_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
         .expect("failed to build the streaming client")
 });
 
+/// 不跟随重定向的客户端：咪咕的试听地址是 `302` → 直链，
+/// 我们要的是那个 `Location`，跟着跳过去就只能拿到音频字节了。
+static NO_REDIRECT_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
+    reqwest::Client::builder()
+        .pool_max_idle_per_host(POOL_MAX_IDLE_PER_HOST)
+        .pool_idle_timeout(POOL_IDLE_TIMEOUT)
+        .tcp_keepalive(TCP_KEEPALIVE)
+        .tcp_nodelay(true)
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(BODY_DEADLINE)
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent(concat!("lx-parse-gateway/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .expect("failed to build the no-redirect client")
+});
+
+/// 取「不跟随重定向」客户端（给咪咕 `listenSong.do` 用）
+pub(crate) fn no_redirect_client() -> &'static reqwest::Client {
+    &NO_REDIRECT_CLIENT
+}
+
 /// 取流式客户端（给 `/stream/{token}` 用）
 pub(crate) fn streaming_client() -> &'static reqwest::Client {
     &STREAM_CLIENT
@@ -80,4 +101,6 @@ pub(crate) fn streaming_client() -> &'static reqwest::Client {
 /// 启动期预热：让配置错误在启动时炸出来，而不是等第一个请求。
 pub(crate) fn warm_up() {
     Lazy::force(&CLIENT);
+    Lazy::force(&STREAM_CLIENT);
+    Lazy::force(&NO_REDIRECT_CLIENT);
 }

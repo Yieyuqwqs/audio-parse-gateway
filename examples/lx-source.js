@@ -19,23 +19,32 @@ var SOURCES = ['tx', 'wy', 'kw', 'kg', 'mg']
 
 // 每个平台声明的音质：上限写真实能力，别乱吹（吹了 LX 会一直请求拿不到的档）
 // tx：账号权益决定能到哪一档，网关会如实降档并返回能用的链接
+// kw / kg / mg 现在都是网关直连（零凭据）：
+//   kw 无会员 cookie 实测到 320k，kg 免费曲能到 flac，mg 匿名只有 128k；
+//   LX 照下面声明即可，网关会把实际档位放在 data.quality 里如实上报（downgraded 标记）
 var QUALITYS = {
   tx: ['128k', '320k', 'flac', 'flac24bit'],
   wy: ['128k', '320k', 'flac', 'flac24bit'],
   kw: ['128k', '320k', 'flac'],
   kg: ['128k', '320k', 'flac'],
-  mg: ['128k', '320k', 'flac24bit'],
+  mg: ['128k', '320k'],
 }
 
 // 各平台的 id 字段不一样，按优先级挑第一个非空的
 function pickMid(source, info) {
   if (!info) return ''
+  // 咪咕的试听地址要「版权 id + 内容 id」两段，拼成 copyrightId_contentId 再交给网关
+  if (source === 'mg') {
+    var copyrightId = String(info.copyrightId || info.id || '').trim()
+    var contentId = String(info.contentId || info.strMediaMid || info.id || '').trim()
+    if (copyrightId && contentId) return copyrightId + '_' + contentId
+    return copyrightId || contentId
+  }
   var bySource = {
     tx: [info.songmid, info.strMediaMid],
     wy: [info.id, info.songmid],
     kw: [info.rid, info.id],
     kg: [info.hash, info.songmid],
-    mg: [info.copyrightId, info.id],
   }
   var list = bySource[source] || [
     info.songmid, info.hash, info.strMediaMid, info.copyrightId, info.id, info.rid,

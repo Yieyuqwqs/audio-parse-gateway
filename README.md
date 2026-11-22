@@ -12,7 +12,9 @@ REDIS_URL=redis://127.0.0.1:6379/ cargo run --release
 UPSTREAM_A_URL=https://node-a.example.com UPSTREAM_B_URL=https://node-b.example.com cargo run --release
 ```
 
-默认会在 `127.0.0.1` 上自动拉起两个 mock 上游（随机端口），所以**不配任何环境变量也能直接跑通全链路**。
+默认在 `127.0.0.1:8080` 起服务。**kw（酷我）/ kg（酷狗）/ mg（咪咕）三个平台零凭据直连**，
+不配任何环境变量也能解析出真实直链；tx 需要 `TX_COOKIE`+`TX_UIN`，wy 需要 `ENABLE_NETEASE=1`。
+只有把真实适配器全部关掉（`ENABLE_KUWO=0 ENABLE_KUGOU=0 ENABLE_MIGU=0` 且没配 tx/wy/节点）才会回退到两个进程内 mock。
 
 ## 代码结构
 
@@ -23,7 +25,7 @@ UPSTREAM_A_URL=https://node-a.example.com UPSTREAM_B_URL=https://node-b.example.
 | `src/metrics.rs` | Atomic 指标 + Prometheus 文本输出 |
 | `src/quality.rs` | 音质阶梯：档位排序、降档、能力判定、`br`→档位映射 |
 | `src/http.rs` | 全局连接池（进程内唯一 reqwest Client） |
-| `src/upstream/` | 适配层：`Upstream` trait + 节点 / 网易云 / QQ / mock 四个实现 |
+| `src/upstream/` | 适配层：`Upstream` trait + 节点 / 网易云 / QQ / 酷我 / 酷狗 / 咪咕 / mock 七个实现 |
 
 ## 打几发
 
@@ -129,13 +131,16 @@ pub trait Upstream: Send + Sync + fmt::Debug {
 }
 ```
 
-现成三个实现：
+现成七个实现：
 
 | 实现 | 文件 | 说明 |
 | --- | --- | --- |
 | `NodeUpstream` | `src/upstream/node.rs` | 通用 HTTP 解析节点：路径支持 `{source}` `{id}` `{quality}` 模板，可带 Bearer token；响应兼容 `{url}` / `{code:0,data:{url}}` / `{data:{url}}` / `{data:[{url}]}`，有效期字段 `expires_at` / `expi` / `expires` 都认 |
 | `NeteaseUpstream` | `src/upstream/netease.rs` | 网易云官方接口直连（源 `wy`）：音质 → 码率（128k/320k/flac），`expi` 写进 `expires_at`；付费/版权下架时接口返回 `url: null`，这里抛 `NoUrl` 让竞速换路，绝不把死链返回给播放器；带 `NETEASE_COOKIE` 才能拿 320k / flac |
-| `QqUpstream` | `src/upstream/qq.rs` | QQ 音乐直连（源 `tx`）：`vkey.GetVkeyServer/CgiGetVkey`，一次请求带多个文件名取最好一档；`qm_keyst` + `o0<uin>` 才算登录 |
+| `QqUpstream` | `src/upstream/qq.rs` | QQ 音乐直连（源 `tx`）：`vkey.GetVkeyServer/CgiGetVkey`；`qm_keyst` + `o0<uin>` 才算登录。**注意**：一次请求带多个文件名时只有**第一个**能拿到 `purl`，其余一律回 `101404`（不是没权益，是没被受理），所以「多档一次取最好」只在降档链重试时才成立 |
+| `KwUpstream` | `src/upstream/kuwo.rs` | 酷我直连（源 `kw`）：`mobi.s?type=convert_url_with_sign` 拿签名直链，**零凭据就能到 320k**，档位按响应里的 `format`+`bitrate` 如实上报 |
+| `KgUpstream` | `src/upstream/kugou.rs` | 酷狗直连（源 `kg`）：v5 接口按字典序拼参数 + md5 双重签名，**免费曲实测能到 flac（930kbps）** |
+| `MiguUpstream` | `src/upstream/migu.rs` | 咪咕直连（源 `mg`）：`listenSong.do` 的 `302 Location` 就是直链；`music_id` 约定 `copyrightId_contentId` 两段 |
 | `MockUpstream` | `src/upstream/mock.rs` | 进程内假上游：0~120ms 抖动 + 3% 失败率，本地就能验证竞速与失败切换；测试里可以关掉 |
 
 装配只看环境变量（`build_upstreams()`）：
@@ -152,6 +157,12 @@ pub trait Upstream: Send + Sync + fmt::Debug {
 | `ENABLE_QQ=1` 或给 `TX_COOKIE` | 打开 QQ 音乐直连适配器（源 `tx`） |
 | `TX_COOKIE` | QQ 整段 cookie（`qm_keyst=...; uin=o0<QQ号>`），没有就只有 128k |
 | `TX_UIN` | QQ 号 —— 注意请求里要 `o0<QQ号>` 形式，适配器会自动补 |
+| `ENABLE_KUWO`（默认开） | 酷我直连（源 `kw`），`=0` 关闭；零凭据 320k |
+| `KW_COOKIE` | 酷我会员 cookie，带上才可能拿到 flac |
+| `ENABLE_KUGOU`（默认开） | 酷狗 v5 签名直连（源 `kg`），`=0` 关闭；免费曲可到 flac |
+| `KG_COOKIE` | 酷狗 cookie（v5 主链路不需要） |
+| `ENABLE_MIGU`（默认开） | 咪咕 `302` 试听地址直连（源 `mg`），`=0` 关闭；零凭据 128k |
+| `MG_COOKIE` / `MG_USER_ID` | 咪咕会员 cookie / 登录 userId，带上才有 HQ/SQ |
 | `REDIS_URL` | Redis 地址；不配或连不上就只用 L1（启动探测，请求路径零等待） |
 | `RUST_LOG` | 日志级别，默认 `error,access=info,audio_parse_gateway=info` |
 | `AUTO_PROXY` | 需要网关代拉的源（逗号分隔），默认 `tx`；留空即关闭 |
@@ -160,16 +171,17 @@ pub trait Upstream: Send + Sync + fmt::Debug {
 ```bash
 # 接自建节点 + 网易云直连
 UPSTREAM_A_URL=https://node-a.example.com ENABLE_NETEASE=1 cargo run --release
-# 只想本地跑通全链路：什么都不配，自动起两个 mock
+# 什么都不配：kw / kg / mg 三平台直连已默认打开，真实直链开箱可用
+# （想强制用 mock 冒烟：ENABLE_KUWO=0 ENABLE_KUGOU=0 ENABLE_MIGU=0 cargo run --release）
 cargo run --release
 ```
 
 新增一个音源 = 实现 `Upstream` + 在 `build_upstreams()` 里 `push` 一项，
 缓存 / singleflight / 竞速 / 指标这些主链路一行都不用改。
 
-> 平台直连（kw / kg / tx / mg）目前都卡在各家的反爬会话或签名算法上：酷我 web 的 `playUrl`
-> 没有合法 `Hm_Iuvt` 会话就只会回 `The request is illegal!`，旧的 `anti.s` 接口已经退化成返回同一个兜底文件。
-> 所以这类源现阶段走**「节点 + cookie/token」**：节点自己做签名，网关负责缓存、竞速与容错。
+> kw / kg / mg 三家现在都是**网关自己直连**（见下面「零凭据三平台」一节的实测），不再需要节点；
+> 仍然走「节点 + cookie/token」的只剩需要登录态的 tx / wy 高音质场景。酷我 web 的 `playUrl`
+> 依旧要 `Hm_Iuvt` 会话（回 `The request is illegal!`），老的 `anti.s` 也还是兜底文件 —— 都别再用了。
 
 ## 高音质（`flac` / `flac24bit`）
 
@@ -232,6 +244,31 @@ TX_COOKIE='qm_keyst=...; uin=o02310476390'
 
 降档次数进指标 `lx_gateway_quality_downgrades_total`；如果它一直涨、播放器又显示无损，
 说明客户端把「请求档位」当成了实际档位 —— 那是播放器侧的问题，网关这边的语义是准的。
+
+### 零凭据三平台（`kw` / `kg` / `mg`）实测（2026-11-22）
+
+这三家**不需要任何 cookie**，网关自己签名/取地址，所以默认就打开：
+
+| 平台 | 走哪条路 | 零凭据实测 | 能到哪一档 |
+| --- | --- | --- | --- |
+| `kw` 酷我 | `mobi.kuwo.cn/mobi.s?type=convert_url_with_sign&br=…&rid=…` | 签名直链 `206` + `audio/mpeg` | 320k（flac 要会员 cookie） |
+| `kg` 酷狗 | `trackercdn.kugou.com/v5/url`（参数按字典序 + 两次 md5 签名） | `206`，**免费曲也能拿 flac（930kbps）** | flac |
+| `mg` 咪咕 | `app.pd.nf.migu.cn/…/sub/listenSong.do`（`302` → 直链） | `206` + `audio/mpeg` | 匿名只有 128k（`toneFlag` 会被忽略），带 `MG_COOKIE` 才到无损 |
+
+三个坑（都踩过，别再回头找）：
+
+1. **酷我**：`www.kuwo.cn/api/v1/www/music/playUrl` 要 `Hm_Iuvt` 反爬会话，永远
+   `The request is illegal!`；老的 `antiserver.kuwo.cn/anti.s` 已经退化成「不同 rid 返回同一个兜底文件」。
+   正解就是 `mobi.s` 这条，`br` 只是「希望」，实际档位看响应里的 `format` + `bitrate`。
+2. **酷狗**：老的 `trackercdn.kugou.com/i/v2` 一律 128k、会员曲直接 `status:2`；
+   `v5` 才有 320k / flac。签名是「参数按 key 字典序**裸拼接**、前后各加一次盐再 md5」，
+   参数顺序或编码改一个字符就 400（回归用例 `signature_matches_the_reference_implementation` 盯着这条）。
+3. **咪咕**：`music.migu.cn/v3/api/music/audioPlayer/getPlayInfo` 已经下线（`301` → `/v5/`）；
+   而且曲目 id 必须两段（`copyrightId_contentId`），只给一段就 `参数校验失败`——
+   `examples/lx-source.js` 里已经按这个规则拼好 id 了。
+
+三家接口回的直链都是 `http://`，适配器统一升到 `https://`（`upstream::prefer_https`）：
+安卓 targetSdk≥28 的播放器默认**禁止明文 HTTP**，这是「解析成功但没声音」的经典坑之一。
 
 ## 测试
 
@@ -299,7 +336,7 @@ curl -s 'http://127.0.0.1:8080/health'
 
 ### `mock` 标记（判断直链真假）
 
-没有真实上游时，网关会起两个进程内 mock，返回 `*.lx-mock.example` 的**假直链**。
+把真实适配器全关掉时，网关才会起两个进程内 mock，返回 `*.lx-mock.example` 的**假直链**。
 现在这条信息会显式暴露出来：
 
 ```json
@@ -342,8 +379,8 @@ WARN 未配置真实上游，回退到两个进程内 mock（配 UPSTREAM_A_URL 
    ```
 2. **只有 mock 上游**：`curl -s http://127.0.0.1:8080/health | grep -o '"ok":true'`，
    再确认 `platforms.tx.adapters` 里是不是只有 `upstream-a/upstream-b`。
-3. **该平台本来就没适配器**：kg / kw / mg 目前是空的（`ok:false`），LX 里换到这些源必然失败，
-   需要给它们配节点（`UPSTREAM_A_URL` + `UPSTREAM_A_COOKIE`）。
+3. **该平台被关掉了**：kw / kg / mg 现在都自带适配器，`/health` 里 `platforms.kw.ok` 还是 `false`
+   就说明被 `ENABLE_KUWO=0` / `ENABLE_KUGOU=0` / `ENABLE_MIGU=0` 关了（或进程没读到 env）。
 4. **直链 403 放不出来**：QQ 直链默认走网关代拉（`AUTO_PROXY=tx`），`/stream/{token}` 会补 `Referer`；
    如果手动关过 `AUTO_PROXY`，客户端裸拉就容易 403。
 5. **VIP 歌 320k/无损拿不到**：QQ 要先看账号权益（绿钻 320k、豪华绿钻 flac），

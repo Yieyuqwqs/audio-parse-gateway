@@ -15,11 +15,17 @@ use std::{fmt, sync::Arc, time::Duration};
 
 use crate::SourceUrl;
 
+pub mod kugou;
+pub mod kuwo;
+pub mod migu;
 pub mod mock;
 pub mod netease;
 pub mod node;
 pub mod qq;
 
+pub use kugou::KgUpstream;
+pub use kuwo::KwUpstream;
+pub use migu::MiguUpstream;
 pub use mock::MockUpstream;
 pub use netease::NeteaseUpstream;
 pub use node::NodeUpstream;
@@ -34,6 +40,18 @@ pub(crate) fn referer_for(source: &str) -> &'static str {
         "kg" => "https://www.kugou.com/",
         "mg" => "https://music.migu.cn/",
         _ => "",
+    }
+}
+
+/// 把上游直链升级成 https。
+///
+/// 实测酷我 / 酷狗 / QQ 的 CDN 都同时支持 TLS，但接口回的是明文 `http://`；
+/// 安卓 targetSdk≥28 的播放器默认**禁止明文 HTTP**（表现为「解析成功但没声音」），
+/// 所以统一升到 https —— 升不动就原样返回，别把能播的链改坏。
+pub(crate) fn prefer_https(url: &str) -> String {
+    match url.strip_prefix("http://") {
+        Some(rest) => format!("https://{rest}"),
+        None => url.to_string(),
     }
 }
 
@@ -120,9 +138,13 @@ impl UpstreamError {
 
 /// 音源适配器：一个实现 = 一种「拿到直链」的方式。
 ///
-/// 现成三类：
+/// 现成六类：
 /// * [`node::NodeUpstream`]：自建 / 第三方解析节点（HTTP JSON，最通用，可带 token）；
 /// * [`netease::NeteaseUpstream`]：网易云官方接口直连（真实源，可带 cookie 解锁更高音质）；
+/// * [`qq::QqUpstream`]：QQ 音乐 vkey 直连（需要 `qm_keyst` + `o0<uin>`）；
+/// * [`kuwo::KwUpstream`]：酷我 mobi 签名直链（零凭据可到 320k）；
+/// * [`kugou::KgUpstream`]：酷狗 v5 签名直链（零凭据可到 flac）；
+/// * [`migu::MiguUpstream`]：咪咕试听地址 302（零凭据 128k）；
 /// * [`mock::MockUpstream`]：进程内假上游，本地跑通全链路 + 单元测试用。
 #[async_trait::async_trait]
 pub trait Upstream: Send + Sync + fmt::Debug {
@@ -237,4 +259,22 @@ pub async fn race(
         upstream: "race".to_string(),
         after: deadline,
     }))
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn upgrades_plain_http_links_to_https() {
+        assert_eq!(
+            prefer_https("http://fsandroid.kugou.com/a.mp3"),
+            "https://fsandroid.kugou.com/a.mp3"
+        );
+        // 已经是 https / 协议相对 / 空串：原样返回
+        assert_eq!(prefer_https("https://x/a.mp3"), "https://x/a.mp3");
+        assert_eq!(prefer_https("//x/a.mp3"), "//x/a.mp3");
+        assert_eq!(prefer_https(""), "");
+    }
 }

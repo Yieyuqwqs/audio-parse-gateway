@@ -21,7 +21,8 @@
 //! 监控与健康检查：`GET /metrics`（Prometheus 文本格式）、`GET /health`。
 //!
 //! 启动：`cargo run --release`（默认监听 0.0.0.0:8080；没配真实上游时自动起两个 mock）
-//! 接真实音源：`UPSTREAM_A_URL=https://node.example.com cargo run --release`，或 `ENABLE_NETEASE=1` 直连网易云；`REDIS_URL` 可选
+//! 接真实音源：`UPSTREAM_A_URL=https://node.example.com cargo run --release`，`ENABLE_NETEASE=1` / `ENABLE_QQ=1` 打开网易云 / QQ 音乐；
+//! 酷我 / 酷狗 / 咪咕（kw / kg / mg）**零凭据默认直连**，不配任何 env 也能解析；`REDIS_URL` 可选
 //! 自测：`curl 'http://127.0.0.1:8080/api/parse?id=123456&source=kw&quality=320k'`
 
 use std::{
@@ -55,7 +56,8 @@ mod quality;
 mod upstream;
 
 use upstream::{
-    MockUpstream, NeteaseUpstream, NodeUpstream, QqUpstream, TrackRequest, Upstream, UpstreamError,
+    KgUpstream, KwUpstream, MiguUpstream, MockUpstream, NeteaseUpstream, NodeUpstream, QqUpstream,
+    TrackRequest, Upstream, UpstreamError,
 };
 
 pub(crate) use cache::{L2Cache, SingleFlight, L1_CACHE};
@@ -896,6 +898,12 @@ fn validate_music_id(raw: Option<&str>) -> Result<&str, AppError> {
 /// | `ENABLE_QQ=1` 或直接给 `TX_COOKIE` | 打开 QQ 音乐直连适配器（源 `tx`） |
 /// | `TX_COOKIE` | QQ 音乐整段 cookie（`qm_keyst=...; uin=o0<QQ号>`），没登录只有 128k |
 /// | `TX_UIN` | QQ 号（登录态必须，缺了会被当游客） |
+/// | `ENABLE_KUWO`（默认开） | 酷我直连（源 `kw`），`=0` 关闭；零凭据可到 320k |
+/// | `KW_COOKIE` | 酷我会员 cookie，带上才可能拿到 flac |
+/// | `ENABLE_KUGOU`（默认开） | 酷狗 v5 签名直连（源 `kg`），`=0` 关闭；零凭据可到 flac |
+/// | `KG_COOKIE` | 酷狗 cookie（v5 主链路不需要，留给以后解锁更高权益） |
+/// | `ENABLE_MIGU`（默认开） | 咪咕试听地址直连（源 `mg`），`=0` 关闭；零凭据 128k |
+/// | `MG_COOKIE` / `MG_USER_ID` | 咪咕会员 cookie / 登录 userId，带上才有 HQ/SQ |
 ///
 /// 一个真实上游都没配 → 自动起两个进程内 mock，保证 `cargo run` 就能跑通全链路。
 fn build_upstreams() -> Arc<Vec<Arc<dyn Upstream>>> {
@@ -956,8 +964,37 @@ fn build_upstreams() -> Arc<Vec<Arc<dyn Upstream>>> {
         info!("QQ 音乐直连适配器已注册（源 tx）");
     }
 
+    // 下面三个平台**零凭据**就能直连（酷我 / 酷狗 / 咪咕），默认打开；
+    // 想关掉哪个就设 ENABLE_KUWO=0 / ENABLE_KUGOU=0 / ENABLE_MIGU=0。
+    let enabled_by_default = |flag: &str| {
+        std::env::var(flag)
+            .map(|value| !value.is_empty() && value != "0")
+            .unwrap_or(true)
+    };
+
+    if enabled_by_default("ENABLE_KUWO") {
+        let cookie = std::env::var("KW_COOKIE").ok();
+        upstreams.push(Arc::new(KwUpstream::new(UPSTREAM_TIMEOUT).with_cookie(cookie)));
+        info!("酷我直连适配器已注册（源 kw，mobi 签名直链，零凭据 320k）");
+    }
+
+    if enabled_by_default("ENABLE_KUGOU") {
+        let cookie = std::env::var("KG_COOKIE").ok();
+        upstreams.push(Arc::new(KgUpstream::new(UPSTREAM_TIMEOUT).with_cookie(cookie)));
+        info!("酷狗直连适配器已注册（源 kg，v5 签名直链，零凭据可到 flac）");
+    }
+
+    if enabled_by_default("ENABLE_MIGU") {
+        let cookie = std::env::var("MG_COOKIE").ok();
+        let user_id = std::env::var("MG_USER_ID").ok();
+        upstreams.push(Arc::new(
+            MiguUpstream::new(UPSTREAM_TIMEOUT).with_credentials(cookie, user_id),
+        ));
+        info!("咪咕直连适配器已注册（源 mg，302 试听地址，零凭据 128k）");
+    }
+
     if upstreams.is_empty() {
-        warn!("未配置真实上游，回退到两个进程内 mock（配 UPSTREAM_A_URL 或 ENABLE_NETEASE=1 即可接真实音源）");
+        warn!("所有真实上游都被关掉了，回退到两个进程内 mock（删掉 ENABLE_*=0 或配 UPSTREAM_A_URL / ENABLE_NETEASE=1 即可接真实音源）");
         upstreams.push(Arc::new(MockUpstream::new("upstream-a", 80)));
         upstreams.push(Arc::new(MockUpstream::new("upstream-b", 170)));
     }

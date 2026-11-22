@@ -34,6 +34,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 thiserror = "2"
 
+# ---------- 哈希：酷狗 v5 直链要 md5 签名 ----------
+md5 = "0.7"
+
 [profile.release]
 lto = "fat"
 codegen-units = 1
