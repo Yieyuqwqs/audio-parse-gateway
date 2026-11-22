@@ -6,10 +6,7 @@
 //!   命中缓存会返回死链（播放器秒退、没声音），这是上一版最大的坑；
 //! * 代拉时补齐 `Referer` + 浏览器 UA + 透传客户端 `Range`，把 206/`Content-Length` 原样吐回去。
 
-use std::{
-    sync::atomic::{AtomicU64, Ordering},
-    time::Duration,
-};
+use std::time::Duration;
 
 use axum::{
     body::Body,
@@ -43,7 +40,6 @@ struct Target {
 /// 进程内短链表：token -> (直链, Referer)
 pub(crate) struct ProxyStore {
     targets: DashMap<String, Target>,
-    counter: AtomicU64,
     /// 对外可访问的 base（例如 http://127.0.0.1:8080），用来拼绝对 URL
     base_url: String,
 }
@@ -52,7 +48,6 @@ impl ProxyStore {
     pub(crate) fn new(base_url: String) -> Self {
         Self {
             targets: DashMap::new(),
-            counter: AtomicU64::new(0),
             base_url: base_url.trim_end_matches('/').to_string(),
         }
     }
@@ -91,10 +86,12 @@ impl ProxyStore {
         format!("{}/stream/{token}", self.base_url)
     }
 
-    /// 目标 → 稳定 token（64 位 FNV-1a × 两轮混合，够用且不引依赖；只用于「找得到自己存的目标」）
+    /// 目标 → 稳定 token（64 位 FNV-1a × 两轮混合，够用且不引依赖）。
+    ///
+    /// **只由内容决定**：同一个 (url, referer) 永远得到同一个 token。
+    /// 之前掺了自增盐，同一首歌每次换个短链，缓存/重试互相不认识（自己写的用例当场抓到）。
     fn token_for(&self, url: &str, referer: &str) -> String {
-        let seed = self.counter.fetch_add(1, Ordering::Relaxed) as u64;
-        let mut h1: u64 = 0xcbf2_9ce4_8422_2325 ^ seed;
+        let mut h1: u64 = 0xcbf2_9ce4_8422_2325;
         let mut h2: u64 = 0x8422_2325_cbf2_9ce4;
         for byte in url.bytes().chain(b'|'.to_string().bytes()).chain(referer.bytes()) {
             h1 = (h1 ^ byte as u64).wrapping_mul(0x0000_0100_0000_01b3);
