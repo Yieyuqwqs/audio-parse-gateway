@@ -93,12 +93,14 @@ if [ -f ./env.sh ]; then
 else
   printf '\033[33m[run]\033[0m 没有 env.sh（凭据未加载）\n'
 fi
-printf '\033[36m[run]\033[0m env: ENABLE_QQ=%s ENABLE_NETEASE=%s TX_UIN=%s TX_COOKIE=%s NETEASE_COOKIE=%s\n' \
-  "${ENABLE_QQ:-unset}" "${ENABLE_NETEASE:-unset}" "${TX_UIN:-unset}" \
+printf '\033[36m[run]\033[0m env: ENABLE_QQ=%s ENABLE_NETEASE=%s ENABLE_KUWO=%s ENABLE_KUGOU=%s ENABLE_MIGU=%s TX_UIN=%s TX_COOKIE=%s NETEASE_COOKIE=%s\n' \
+  "${ENABLE_QQ:-unset}" "${ENABLE_NETEASE:-unset}" "${ENABLE_KUWO:-default-on}" \
+  "${ENABLE_KUGOU:-default-on}" "${ENABLE_MIGU:-default-on}" "${TX_UIN:-unset}" \
   "${TX_COOKIE:+set(${#TX_COOKIE}chars)}" "${NETEASE_COOKIE:+set}"
-if [ -z "${ENABLE_QQ:-}${ENABLE_NETEASE:-}${UPSTREAM_A_URL:-}" ]; then
-  printf '\033[33m[run]\033[0m 警告：没有检测到真实上游（ENABLE_QQ / ENABLE_NETEASE / UPSTREAM_A_URL 都为空）\n'
-  printf '\033[33m[run]\033[0m       现在只会返回 mock 假直链，播放器一定「换源失败」\n'
+# 酷我 / 酷狗 / 咪咕是零凭据直连，默认就开着；只有把它们全关掉且没配 tx/wy/节点，才会回退 mock
+if [ "${ENABLE_KUWO:-1}" = "0" ] && [ "${ENABLE_KUGOU:-1}" = "0" ] && [ "${ENABLE_MIGU:-1}" = "0" ] \
+   && [ -z "${ENABLE_QQ:-}${ENABLE_NETEASE:-}${UPSTREAM_A_URL:-}" ]; then
+  printf '\033[33m[run]\033[0m 警告：五个平台的适配器全被关掉了，现在只会返回 mock 假直链\n'
 fi
 
 # 没有 redis 就不用设 REDIS_URL：启动探测一次失败后 L2 会永久关闭，请求路径零等待
@@ -141,6 +143,9 @@ cat <<EOF
  安装完成
  启动： bash ${APP_DIR}/run.sh
  测试： curl 'http://127.0.0.1:8080/health'
+        curl 'http://127.0.0.1:8080/api/parse?id=154706365&source=kw&quality=320k'   # 酷我（零凭据）
+        curl 'http://127.0.0.1:8080/api/parse?id=1616C0383A01C80738065697D8548193&source=kg&quality=flac'  # 酷狗（零凭据）
+        curl 'http://127.0.0.1:8080/api/parse?id=64046801861_600908000004734752&source=mg&quality=128k'    # 咪咕（两段 id）
         curl 'http://127.0.0.1:8080/api/parse?id=002lzYCa14usQ5&source=tx&quality=320k'
  日志： 每请求一行（08:53:38 | [200] tx ... | 780ms）
  停止： Ctrl+C 或 pkill -f audio-parse-gateway
