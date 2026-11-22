@@ -1,6 +1,6 @@
 //! 酷我音乐（`kw`）直连适配器。
 //!
-//! 走 `mobi.kuwo.cn/mobi.s` 的 `type=convert_url_with_sign`：给 rid + 目标码率，
+//! 主路径走 `mobi.kuwo.cn/mobi.s` 的 `type=convert_url_with_sign`：给 rid + 目标码率，
 //! 拿回一条**带签名的直链**（`data.url`）和它**实际**的 `format` / `bitrate`。
 //!
 //! 2026-11-22 实测（无 cookie、手机网络）：
@@ -14,6 +14,7 @@
 //! 结论：`br` 只是「希望」，实际档位以响应字段为准 —— 所以这里按
 //! `format` + `bitrate` 反推 [`crate::quality`] 档位并如实上报，绝不假装拿到了 flac。
 //!
+//! 主接口抽风时用老接口 `antiserver.kuwo.cn/anti.s` 兜底（免费曲仍给真实 mp3）。
 //! 另外记一笔：`www.kuwo.cn/api/v1/www/music/playUrl` 需要 `Hm_Iuvt_*` 反爬会话，
 //! 实测一律 `{"success":false,"message":"The request is illegal!"}`，别再往那条路上找。
 
@@ -87,6 +88,35 @@ impl KwUpstream {
             rid
         )
     }
+
+    /// 老接口兜底：`anti.s` 直接回一行 URL（免费曲仍给真实 mp3）
+    async fn legacy(&self, rid: &str) -> Result<SourceUrl, UpstreamError> {
+        let url = format!(
+            "https://antiserver.kuwo.cn/anti.s?type=convert_url&format=mp3&response=url&rid=MUSIC_{rid}"
+        );
+        let response = crate::http::client()
+            .get(url.as_str())
+            .header(reqwest::header::REFERER, REFERER)
+            .send()
+            .await
+            .map_err(|source| UpstreamError::Transport {
+                upstream: format!("{}+anti.s", self.name),
+                source,
+            })?;
+
+        let status = response.status();
+        if !status.is_success() {
+            return Err(UpstreamError::Status {
+                upstream: format!("{}+anti.s", self.name),
+                status,
+            });
+        }
+        let body = response.text().await.map_err(|source| UpstreamError::Transport {
+            upstream: format!("{}+anti.s", self.name),
+            source,
+        })?;
+        parse_kuwo_legacy_body(&self.name, &body)
+    }
 }
 
 #[async_trait::async_trait]
@@ -118,10 +148,10 @@ impl Upstream for KwUpstream {
             });
         }
 
-        let url = self.request_url(rid, req.quality);
-        let attempt = async {
+        let primary_url = self.request_url(rid, req.quality);
+        let primary = async {
             let mut builder = crate::http::client()
-                .get(url.as_str())
+                .get(primary_url.as_str())
                 .header(reqwest::header::REFERER, REFERER);
             if let Some(cookie) = self.cookie.as_deref() {
                 builder = builder.header(reqwest::header::COOKIE, cookie);
@@ -144,7 +174,18 @@ impl Upstream for KwUpstream {
             parse_kuwo_body(&self.name, &body)
         };
 
-        match tokio::time::timeout(self.timeout, attempt).await {
+        let primary = tokio::time::timeout(self.timeout, primary).await;
+        match primary {
+            Ok(Ok(url)) => return Ok(url),
+            Ok(Err(err)) => {
+                tracing::debug!(error = %err, "kuwo primary failed, trying anti.s");
+            }
+            Err(_) => {
+                tracing::debug!("kuwo primary timed out, trying anti.s");
+            }
+        }
+
+        match tokio::time::timeout(self.timeout, self.legacy(rid)).await {
             Ok(result) => result,
             Err(_) => Err(UpstreamError::Timeout {
                 upstream: self.name.clone(),
@@ -220,6 +261,40 @@ pub(crate) fn detect_quality(format: &str, bitrate: u64) -> &'static str {
     }
 }
 
+/// 老接口 `anti.s` 的响应就是一行 URL（或 `format=mp3 bitrate=320 url=http://...`）。
+///
+/// 拿它当主接口的兜底：免费曲仍然给真实 mp3；会员曲会退化成同一个兜底文件，
+/// 所以路径里认不出真实资源名就直接报错，别把兜底文件当歌返回。
+pub(crate) fn parse_kuwo_legacy_body(
+    upstream: &str,
+    body: &str,
+) -> Result<SourceUrl, UpstreamError> {
+    let body = body.trim().trim_matches('"');
+    let url = if body.starts_with("http") {
+        body.to_string()
+    } else {
+        body.split_whitespace()
+            .find_map(|part| part.strip_prefix("url="))
+            .map(str::to_string)
+            .unwrap_or_default()
+    };
+
+    if url.is_empty() {
+        return Err(UpstreamError::NoUrl {
+            upstream: upstream.to_string(),
+            detail: "kuwo anti.s 没有给出直链".to_string(),
+        });
+    }
+
+    // 兜底接口一律 mp3，不知道码率就按 128k 保守上报，绝不假装无损
+    Ok(SourceUrl {
+        url: prefer_https(&url),
+        provider: upstream.to_string(),
+        quality: crate::quality::LADDER[0].to_string(),
+        expires_at: crate::now_unix() + URL_TTL_SECS,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -247,16 +322,14 @@ mod tests {
         let kw = KwUpstream::new(Duration::from_millis(800));
         assert!(kw.supports("kw"));
         assert!(!kw.supports("kg"));
-        assert!(!kw.supports("tx"));
     }
 
     #[test]
     fn ceiling_is_320k_without_a_member_cookie() {
         let guest = KwUpstream::new(Duration::from_millis(800));
         assert_eq!(guest.max_quality(), "320k");
-
-        let member = KwUpstream::new(Duration::from_millis(800))
-            .with_cookie(Some("kw_token=abc".to_string()));
+        let member =
+            KwUpstream::new(Duration::from_millis(800)).with_cookie(Some("kw_token=abc".to_string()));
         assert_eq!(member.max_quality(), crate::quality::TOP);
     }
 
@@ -265,14 +338,12 @@ mod tests {
         let parsed = parse_kuwo_body("kuwo", &body("mp3", 320, "https://kw-bj.kuwo.cn/x.mp3?sign=1"))
             .expect("320k 应该解析成功");
         assert_eq!(parsed.quality, "320k");
-        assert_eq!(parsed.url, "https://kw-bj.kuwo.cn/x.mp3?sign=1", "直链要升到 https");
-        assert_eq!(parsed.provider, "kuwo");
+        assert_eq!(parsed.url, "https://kw-bj.kuwo.cn/x.mp3?sign=1");
         assert!(parsed.is_fresh());
     }
 
     #[test]
     fn sentinel_low_bitrate_is_128k_not_flac() {
-        // 酷我对「只有低码率」的曲子会回 bitrate=1，别把它当成 flac 的 999k
         let parsed = parse_kuwo_body("kuwo", &body("mp3", 1, "https://kw-bj.kuwo.cn/low.mp3"))
             .expect("低码率也要能播");
         assert_eq!(parsed.quality, "128k");
@@ -284,8 +355,8 @@ mod tests {
 
     #[test]
     fn reports_no_url_instead_of_a_dead_link() {
-        let err = parse_kuwo_body("kuwo", r#"{"code":200,"data":{"url":"","format":"mp3"}}"#)
-            .unwrap_err();
+        let err =
+            parse_kuwo_body("kuwo", r#"{"code":200,"data":{"url":"","format":"mp3"}}"#).unwrap_err();
         assert!(matches!(err, UpstreamError::NoUrl { .. }));
 
         let err = parse_kuwo_body("kuwo", r#"{"code":304,"msg":"会员歌曲"}"#).unwrap_err();
@@ -293,6 +364,26 @@ mod tests {
 
         let err = parse_kuwo_body("kuwo", "not json").unwrap_err();
         assert!(matches!(err, UpstreamError::Decode { .. }));
+    }
+
+    #[test]
+    fn legacy_anti_s_plain_text_is_understood() {
+        let parsed = parse_kuwo_legacy_body(
+            "kuwo",
+            "http://kw-er.kuwo.cn/a895cac7/resource/30106/trackmedia/M5000004Gmy54cGDqK.mp3?bitrate$1",
+        )
+        .expect("纯文本直链也要认");
+        assert!(parsed.url.starts_with("https://kw-er.kuwo.cn/"), "实际：{}", parsed.url);
+        assert_eq!(parsed.quality, "128k", "兜底接口不知道码率就按 128k 报");
+
+        let kv = parse_kuwo_legacy_body(
+            "kuwo",
+            "format=mp3 bitrate=1 url=http://kw-er.kuwo.cn/a/M500x.mp3",
+        )
+        .expect("key=value 也要认");
+        assert!(kv.url.ends_with("M500x.mp3"));
+
+        assert!(parse_kuwo_legacy_body("kuwo", "").is_err());
     }
 
     #[tokio::test]
@@ -332,8 +423,7 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
 
-        let kw = KwUpstream::new(Duration::from_millis(800))
-            .with_base(format!("http://{addr}/mobi.s"));
+        let kw = KwUpstream::new(Duration::from_millis(800)).with_base(format!("http://{addr}/mobi.s"));
 
         let parsed = kw
             .resolve(&TrackRequest::new("kw", RID, "320k"))

@@ -36,7 +36,7 @@ use std::{
 
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
     Json, Router,
@@ -94,6 +94,11 @@ const L2_OP_TIMEOUT: Duration = Duration::from_millis(150);
 const L2_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 
 const DEFAULT_SOURCE: &str = "kw";
+/// `?multi=1`：主源挂了就拿歌名+歌手去这几个**零凭据**平台试试（按顺序，谁先成功用谁）。
+///
+/// 这一条是「零 CK 也要出声」的关键：tx / wy 的高档位要靠会员 cookie，
+/// 而 kw / kg / mg 匿名就能拿到可播直链，主源回 404/无权益时自动顶上。
+const MULTI_SOURCE_LADDER: [&str; 3] = ["kg", "kw", "mg"];
 const DEFAULT_QUALITY: &str = "320k";
 /// LX 支持的源 key
 const SUPPORTED_SOURCES: [&str; 6] = ["kw", "kg", "tx", "wy", "mg", "local"];
@@ -106,7 +111,7 @@ const SUPPORTED_SOURCES: [&str; 6] = ["kw", "kg", "tx", "wy", "mg", "local"];
 /// 上游解析出来的播放地址（会被缓存，因此必须 `Serialize + Deserialize`）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SourceUrl {
-    /// 最终播放地址（带签名的直链）
+    /// 最终播放地址（带签名的直链，**始终是上游原链**：代拉的改写只发生在出口）
     url: String,
     /// 提供该地址的上游节点名，便于排查是哪一路赢的
     #[serde(default)]
@@ -208,6 +213,8 @@ struct ParseQuery {
     keyword: Option<String>,
     /// 歌曲名（跨平台回退用）
     name: Option<String>,
+    /// `multi=1`：主源失败后依次试 kg / kw / mg（都是零凭据平台）
+    multi: Option<String>,
     /// 歌手名（跨平台回退用）
     singer: Option<String>,
 }
@@ -217,6 +224,8 @@ struct ParseQuery {
 struct ParseOptions {
     /// 主源失败后是否允许跨平台二次搜索
     fallback: bool,
+    /// 主源失败后是否依次试 MULTI_SOURCE_LADDER
+    multi: bool,
     keyword: Option<String>,
 }
 
@@ -252,7 +261,18 @@ impl ParseOptions {
                 })
             });
 
-        Self { fallback, keyword }
+        let multi = query
+            .multi
+            .as_deref()
+            .map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false);
+
+        Self { fallback, multi, keyword }
     }
 
     /// 允许回退时才把关键词交出去
@@ -507,12 +527,8 @@ impl AppState {
             url.quality = candidate.to_string();
         }
 
-        // 防盗链：QQ 这类 CDN 是按 **User-Agent** 挡的（播放器 UA 会拿到 200 + 0 字节），
-        // 所以不做探测、对 AUTO_PROXY 平台无条件换成网关代拉地址（代拉会带浏览器 UA + Referer）。
-        if self.should_proxy(source) {
-            let referer = upstream::referer_for(source);
-            url.url = self.proxy.link(url.url.clone(), referer.to_string());
-        }
+        // 注意：这里**不再**改写直链。代拉短链只活 30 分钟，写进缓存就会出现
+        // 「10 分钟后命中缓存 → 返回过期 token → 播放器 404 静音」，改写统一放到出口（respond）。
 
         self.stats.upstream_hits.fetch_add(1, Ordering::Relaxed);
 
@@ -551,7 +567,31 @@ impl AppState {
         self.resolve("wy", &song_id, quality).await
     }
 
-    /// 这个源的直链要不要走网关代拉（`AUTO_PROXY`，默认只代拉 `tx`）
+    /// 多平台混音：主源失败时依次拿同一个 id 去零凭据平台试。
+    ///
+    /// 注意这里是「同一个 id」——只有 kw / wy / mg 的 id 有可能互通（都可能是纯数字）：
+    /// tx 的 songmid、kg 的 hash 拿去问酷我必然是错的 id，所以非纯数字直接跳过。
+    async fn multi_source(&self, music_id: &str, quality: &'static str) -> Option<Resolved> {
+        if music_id.is_empty() || !music_id.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        for candidate in MULTI_SOURCE_LADDER {
+            match self.resolve(candidate, music_id, quality).await {
+                Ok(resolved) => {
+                    debug!(source = candidate, "multi-source ladder served the request");
+                    return Some(resolved);
+                }
+                Err(err) => {
+                    debug!(source = candidate, error = %err, "multi-source candidate failed");
+                }
+            }
+        }
+        None
+    }
+
+    /// 这个源的直链要不要走网关代拉（`AUTO_PROXY`，默认只代拉 `tx`）。
+    ///
+    /// 只在**出口**用（`respond`）：缓存里永远是上游原链，这里决定了给客户端的是原链还是 `/stream`。
     fn should_proxy(&self, source: &str) -> bool {
         static AUTO_PROXY: Lazy<Vec<String>> = Lazy::new(|| {
             std::env::var("AUTO_PROXY")
@@ -621,30 +661,41 @@ fn access_log(status: u16, source: &str, music_id: &str, quality: &str, started:
 /// 跨平台回退示例：`?source=tx&id=<songmid>&fallback=1&name=海阔天空&singer=Beyond`
 async fn parse_handler(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(query): Query<ParseQuery>,
 ) -> Result<Json<OkBody>, AppError> {
     let source = normalize_source(query.source.as_deref())?;
     let quality = normalize_quality(query.quality.as_deref())?;
     let music_id = validate_music_id(query.id.as_deref())?;
     let options = ParseOptions::from_query(&query);
-    respond(&state, source, music_id, quality, &options).await
+    respond(&state, public_base(&headers), source, music_id, quality, &options).await
 }
 
 /// `GET /url/{source}/{music_id}?quality=320k`（LX 风格的短链接口，方便脚本直连）
 async fn lx_url_handler(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path((source, music_id)): Path<(String, String)>,
     Query(query): Query<QualityQuery>,
 ) -> Result<Json<OkBody>, AppError> {
     let source = normalize_source(Some(source.as_str()))?;
     let quality = normalize_quality(query.quality.as_deref())?;
     let music_id = validate_music_id(Some(music_id.as_str()))?;
-    respond(&state, source, music_id, quality, &ParseOptions::default()).await
+    respond(
+        &state,
+        public_base(&headers),
+        source,
+        music_id,
+        quality,
+        &ParseOptions::default(),
+    )
+    .await
 }
 
 /// 两个入口共用的响应组装：解析（含降级链 / 跨平台回退） → LX 响应包 → 一行访问日志
 async fn respond(
     state: &AppState,
+    client_base: String,
     source: &'static str,
     music_id: &str,
     quality: &'static str,
@@ -656,7 +707,12 @@ async fn respond(
     let resolved = match state.resolve(source, music_id, quality).await {
         Ok(resolved) => resolved,
         Err(primary) => {
-            // 主源彻底失败：如果客户端要跨平台且给了关键词，就去网易云再搜一次
+            // 主源彻底失败：先试零凭据多平台（multi=1），再走网易云搜索回退（fallback=1）
+            if options.multi {
+                if let Some(resolved) = state.multi_source(music_id, quality).await {
+                    return finish(state, client_base, resolved, music_id, quality, started).await;
+                }
+            }
             let Some(keyword) = options.fallback_keyword() else {
                 access_log(primary.status().as_u16(), source, music_id, quality, started);
                 return Err(primary);
@@ -675,41 +731,7 @@ async fn respond(
         }
     };
 
-    let downgraded = resolved.downgraded();
-    if downgraded {
-        state.stats.downgraded.fetch_add(1, Ordering::Relaxed);
-    }
-
-    // 直链是不是 mock 造的假地址（给客户端一个明确信号，别让它傻试）
-    let mock = state
-        .upstreams
-        .iter()
-        .any(|upstream| upstream.is_mock() && upstream.name() == resolved.url.provider.as_str());
-
-    access_log(
-        200,
-        resolved.source,
-        music_id,
-        &resolved.url.quality,
-        started,
-    );
-
-    Ok(Json(OkBody {
-        code: 0,
-        msg: "success",
-        data: TrackData {
-            url: resolved.url.url,
-            source: resolved.source.to_string(),
-            quality: resolved.url.quality.clone(),
-            requested_quality: quality.to_string(),
-            downgraded,
-            mock,
-            provider: resolved.url.provider,
-            cache: resolved.layer,
-            coalesced: resolved.coalesced,
-            elapsed_ms: started.elapsed().as_millis() as u64,
-        },
-    }))
+    finish(state, client_base, resolved, music_id, quality, started).await
 }
 
 /// 五个平台各自有多少适配器在服务（启动自检与 `/health` 共用）
@@ -762,9 +784,30 @@ async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
     }))
 }
 
-/// 启动自检用的一首样曲（`kg` 需要真实 hash，拿不到就跳过）
-/// 代拉短链的对外 base：`PUBLIC_BASE_URL` 优先，否则按 BIND_ADDR 推导（0.0.0.0 用 127.0.0.1）。
-fn public_base() -> String {
+/// 代拉短链的对外 base：**优先用请求自己的 Host**，其次 `PUBLIC_BASE_URL`，最后才是 BIND_ADDR。
+///
+/// 以前只看 BIND_ADDR，手机上推出的是 `http://127.0.0.1:8080` —— 客户端（PC 上的 LX、
+/// 另一台手机、反代后面的浏览器）拿到这个地址会去连它自己，必然「解析成功但没声音」。
+fn public_base(headers: &HeaderMap) -> String {
+    let from_request = headers
+        .get(axum::http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|host| !host.is_empty())
+        .map(|host| {
+            // 反代常见：X-Forwarded-Proto 表示客户端那侧的协议
+            let scheme = headers
+                .get("x-forwarded-proto")
+                .and_then(|value| value.to_str().ok())
+                .map(str::trim)
+                .filter(|scheme| *scheme == "http" || *scheme == "https")
+                .unwrap_or("http");
+            format!("{scheme}://{host}")
+        });
+
+    if let Some(base) = from_request {
+        return base;
+    }
     if let Ok(base) = std::env::var("PUBLIC_BASE_URL") {
         if !base.trim().is_empty() {
             return base.trim().trim_end_matches('/').to_string();
@@ -1047,7 +1090,7 @@ async fn main() -> Result<(), BoxError> {
         flight: Arc::new(SingleFlight::default()),
         limiter: Arc::new(Semaphore::new(UPSTREAM_MAX_INFLIGHT)),
         stats: Arc::new(Stats::default()),
-        proxy: Arc::new(proxy::ProxyStore::new(public_base())),
+        proxy: Arc::new(proxy::ProxyStore::new(String::new())),
     };
 
     // 启动自检：tx/kg/kw/wy/mg 五平台的适配器矩阵（STARTUP_PROBE=1 时再并发真打一发）
@@ -1110,13 +1153,74 @@ async fn shutdown_signal() {
 }
 
 // ---------------------------------------------------------------------------
-// 单元测试：适配层错误语义 + 竞速 + singleflight + 缓存 + 参数校验
+// 出口：响应组装（多平台混音 / 网易云回退都从这里出去）
 // ---------------------------------------------------------------------------
+
+async fn finish(
+    state: &AppState,
+    client_base: String,
+    resolved: Resolved,
+    music_id: &str,
+    quality: &'static str,
+    started: Instant,
+) -> Result<Json<OkBody>, AppError> {
+    let downgraded = resolved.downgraded();
+    if downgraded {
+        state.stats.downgraded.fetch_add(1, Ordering::Relaxed);
+    }
+
+    // 直链是不是 mock 造的假地址（给客户端一个明确信号，别让它傻试）
+    let mock = state
+        .upstreams
+        .iter()
+        .any(|upstream| upstream.is_mock() && upstream.name() == resolved.url.provider.as_str());
+
+    // ---- 出口改写：缓存里是上游原链，这里才决定给客户端原链还是 /stream 代拉 ----
+    let upstream_url = resolved.url.url.clone();
+    let proxied = state.should_proxy(resolved.source);
+    let play_url = if proxied {
+        let referer = upstream::referer_for(resolved.source).to_string();
+        state
+            .proxy
+            .link_with_base(client_base.as_str(), upstream_url.clone(), referer)
+    } else {
+        upstream_url.clone()
+    };
+
+    access_log(
+        200,
+        resolved.source,
+        music_id,
+        &resolved.url.quality,
+        started,
+    );
+    debug!(proxied, upstream = %upstream_url, play = %play_url, "resolved for the client");
+
+    Ok(Json(OkBody {
+        code: 0,
+        msg: "success",
+        data: TrackData {
+            url: play_url,
+            source: resolved.source.to_string(),
+            quality: resolved.url.quality.clone(),
+            requested_quality: quality.to_string(),
+            downgraded,
+            mock,
+            provider: resolved.url.provider,
+            cache: resolved.layer,
+            coalesced: resolved.coalesced,
+            elapsed_ms: started.elapsed().as_millis() as u64,
+        },
+    }))
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    /// 测试里模拟「请求来自 http://gw.test」：出口改写会用它拼代拉短链
+    const TEST_BASE: &str = "http://gw.test:8080";
 
     /// 可编程的假适配器：能配延迟、强制失败、只支持某个音源、最高只给到某档音质。
     #[derive(Debug)]
@@ -1398,7 +1502,7 @@ mod tests {
         let upstreams: Vec<Arc<dyn Upstream>> = vec![Arc::new(FakeUpstream::new("m"))];
         let state = state_with(upstreams);
         // 必须走 handler（respond）才会累加 requests_total；直接 resolve 只动命中/穿透计数
-        let payload = respond(&state, "kw", "metrics-1", "320k", &ParseOptions::default())
+        let payload = respond(&state, TEST_BASE.to_string(), "kw", "metrics-1", "320k", &ParseOptions::default())
             .await
             .expect("先打一发");
         assert_eq!(payload.0.code, 0);
@@ -1498,7 +1602,7 @@ mod tests {
             vec![Arc::new(FakeUpstream::new("lossy").with_ceiling("320k"))];
         let state = state_with(upstreams);
 
-        let payload = respond(&state, "wy", "quality-report-1", "flac", &ParseOptions::default())
+        let payload = respond(&state, TEST_BASE.to_string(), "wy", "quality-report-1", "flac", &ParseOptions::default())
             .await
             .expect("降档之后仍然是成功响应");
 
@@ -1513,7 +1617,7 @@ mod tests {
         let upstreams: Vec<Arc<dyn Upstream>> =
             vec![Arc::new(FakeUpstream::new("lossy-m").with_ceiling("320k"))];
         let state = state_with(upstreams);
-        let payload = respond(&state, "wy", "quality-metric-1", "flac", &ParseOptions::default())
+        let payload = respond(&state, TEST_BASE.to_string(), "wy", "quality-metric-1", "flac", &ParseOptions::default())
             .await
             .expect("降档请求");
         assert!(payload.0.data.downgraded, "这一发本来就该降档");
@@ -1581,15 +1685,50 @@ mod tests {
 
         let options = ParseOptions {
             fallback: true,
+            multi: false,
             keyword: Some("海阔天空 Beyond".to_string()),
         };
-        let payload = respond(&state, "tx", "002RsKKv2Rd7Ih", "320k", &options)
+        let payload = respond(&state, TEST_BASE.to_string(), "tx", "002RsKKv2Rd7Ih", "320k", &options)
             .await
             .expect("跨平台回退应该成功");
 
         assert_eq!(payload.0.code, 0);
         assert_eq!(payload.0.data.source, "wy", "回退后应报实际的源");
         assert!(payload.0.data.url.contains("999"), "应走搜索到的 id");
+    }
+
+    #[tokio::test]
+    async fn multi_source_ladder_rescues_a_numeric_id() {
+        // tx 挂了（没 cookie），但同一个纯数字 id 在 kg 上有货 → multi=1 应该救回来
+        let upstreams: Vec<Arc<dyn Upstream>> = vec![
+            Arc::new(FakeUpstream::new("qq").only_for("tx").failing()),
+            Arc::new(FakeUpstream::new("kugou").only_for("kg")),
+        ];
+        let state = state_with(upstreams);
+
+        let options = ParseOptions {
+            fallback: false,
+            multi: true,
+            keyword: None,
+        };
+        let payload = respond(&state, TEST_BASE.to_string(), "tx", "1234567", "128k", &options)
+            .await
+            .expect("多平台混音应该顶上");
+        assert_eq!(payload.0.data.source, "kg", "应该报实际出直链的平台");
+    }
+
+    #[tokio::test]
+    async fn multi_source_skips_ids_that_belong_to_another_platform() {
+        // tx 的 songmid 不是纯数字，拿去问酷我/酷狗只会拿到错歌 → 直接不试
+        let upstreams: Vec<Arc<dyn Upstream>> = vec![
+            Arc::new(FakeUpstream::new("qq").only_for("tx").failing()),
+            Arc::new(FakeUpstream::new("kugou").only_for("kg")),
+        ];
+        let state = state_with(upstreams);
+        assert!(
+            state.multi_source("002lzYCa14usQ5", "128k").await.is_none(),
+            "非纯数字 id 不应该进混音链"
+        );
     }
 
     #[tokio::test]
@@ -1602,9 +1741,10 @@ mod tests {
         // 没给 fallback=1：就算有关键词也不该去搜
         let options = ParseOptions {
             fallback: false,
+            multi: false,
             keyword: Some("海阔天空".to_string()),
         };
-        let err = respond(&state, "tx", "002RsKKv2Rd7Ih", "320k", &options)
+        let err = respond(&state, TEST_BASE.to_string(), "tx", "002RsKKv2Rd7Ih", "320k", &options)
             .await
             .unwrap_err();
         assert_eq!(err.into_response().status(), StatusCode::BAD_GATEWAY);
@@ -1635,7 +1775,7 @@ mod tests {
             vec![Arc::new(MockUpstream::new("upstream-a", 0).without_failures())];
         let state = state_with(upstreams);
 
-        let payload = respond(&state, "kw", "mock-flag-1", "320k", &ParseOptions::default())
+        let payload = respond(&state, TEST_BASE.to_string(), "kw", "mock-flag-1", "320k", &ParseOptions::default())
             .await
             .expect("mock 也要能正常返回");
 
@@ -1648,7 +1788,7 @@ mod tests {
         let upstreams: Vec<Arc<dyn Upstream>> = vec![Arc::new(FakeUpstream::new("qq").only_for("tx"))];
         let state = state_with(upstreams);
 
-        let payload = respond(&state, "tx", "mock-flag-2", "320k", &ParseOptions::default())
+        let payload = respond(&state, TEST_BASE.to_string(), "tx", "mock-flag-2", "320k", &ParseOptions::default())
             .await
             .expect("真实适配器");
 
@@ -1672,3 +1812,5 @@ mod tests {
         assert!(text.contains("\"mock_upstreams\":1"), "实际: {text}");
     }
 }
+
+/// 组装 LX 响应包（出口改写 → 指标 → 访问日志）

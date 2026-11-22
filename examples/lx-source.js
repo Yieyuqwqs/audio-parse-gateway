@@ -123,6 +123,8 @@ function musicUrl(source, info, quality) {
     var singer = singerOf(info)
     if (singer) params.push('singer=' + encodeURIComponent(singer))
     params.push('fallback=1')
+    // multi=1：主源没权益/挂了，就让网关拿同一个 id 去 kg / kw / mg 找（这几家零凭据就能播）
+    params.push('multi=1')
   }
 
   var url = BASE_URL + '/url/' + source + '/' + encodeURIComponent(mid) + '?' + params.join('&')
