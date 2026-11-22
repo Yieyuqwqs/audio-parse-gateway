@@ -41,6 +41,7 @@ use axum::{
     routing::get,
     Json, Router,
 };
+use dashmap::DashMap;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, Semaphore};
@@ -343,6 +344,9 @@ struct AppState {
     pub(crate) stats: Arc<Stats>,
     /// 防盗链代拉的短链表
     pub(crate) proxy: Arc<proxy::ProxyStore>,
+    /// 粘性赢家：每个音源上次是谁最快出的链。下次竞速把它排到第一位，
+    /// 慢的适配器就不会拖住 `select!`（首字延迟先从这条开始抠）。
+    pub(crate) sticky: Arc<DashMap<&'static str, String>>,
 }
 
 /// 一次解析的结果 + 命中信息
@@ -465,6 +469,12 @@ impl AppState {
             return Ok(Resolved::new(url, layer, requested, coalesced, source));
         }
 
+        // 粘性赢家：同一音源上次出的链由谁给的，这次让它先跑；race 仍然并行，只是顺序变了
+        let mut ordered: Vec<Arc<dyn Upstream>> = self.upstreams.as_ref().clone();
+        if let Some(winner) = self.sticky.get(source).map(|entry| entry.value().clone()) {
+            ordered.sort_by_key(|upstream| u8::from(upstream.name() != winner));
+        }
+
         // ---- 3) 上游竞速（唯一的穿透点） ----
         // 过载保护：拿不到令牌就快速失败，而不是把请求堆在队列里拖垮自己
         let permit = self.limiter.try_acquire().map_err(|_| AppError::Overloaded)?;
@@ -483,8 +493,11 @@ impl AppState {
             }
             let slice = RACE_DEADLINE.min(remaining);
             let request = TrackRequest::new(source, music_id, candidate);
-            match upstream::race(&self.upstreams, &request, slice).await {
+            match upstream::race(&ordered, &request, slice).await {
                 Ok(url) => {
+                    if !url.provider.is_empty() {
+                        self.sticky.insert(source, url.provider.clone());
+                    }
                     winner = Some(url);
                     break;
                 }
@@ -1134,6 +1147,7 @@ async fn main() -> Result<(), BoxError> {
         limiter: Arc::new(Semaphore::new(UPSTREAM_MAX_INFLIGHT)),
         stats: Arc::new(Stats::default()),
         proxy: Arc::new(proxy::ProxyStore::new(String::new())),
+        sticky: Arc::new(DashMap::new()),
     };
 
     // 启动自检：tx/kg/kw/wy/mg 五平台的适配器矩阵（STARTUP_PROBE=1 时再并发真打一发）
@@ -1399,6 +1413,7 @@ mod tests {
             limiter: Arc::new(Semaphore::new(64)),
             stats: Arc::new(Stats::default()),
             proxy: Arc::new(proxy::ProxyStore::new("http://127.0.0.1:8080".to_string())),
+            sticky: Arc::new(DashMap::new()),
         }
     }
 
