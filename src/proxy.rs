@@ -102,23 +102,26 @@ impl ProxyStore {
             return false;
         };
 
+        // 关键：**不能带 Range**。腾讯 CDN 对「带 Range 的裸请求」会正常回 206 + 2 字节，
+        // 但播放器发的是普通 GET，同样裸请求会被挡成 200 + 0 字节（2026-11-22 实测）。
+        // 所以这里必须完全模拟播放器：普通 GET，只读第一个 chunk 就断开。
         let request = crate::http::client()
             .get(parsed)
-            .header(reqwest::header::RANGE, "bytes=0-1")
             .header(reqwest::header::USER_AGENT, USER_AGENT);
 
-        let Ok(Ok(response)) = tokio::time::timeout(PROBE_TIMEOUT, request.send()).await else {
+        let Ok(Ok(mut response)) = tokio::time::timeout(PROBE_TIMEOUT, request.send()).await else {
             return true; // 连探测都失败：直接代拉，别赌
         };
 
-        let status = response.status();
-        if !status.is_success() {
+        if !response.status().is_success() {
             return true;
         }
 
-        // 200 也可能是个空壳（防盗链静默拒绝）
-        match tokio::time::timeout(PROBE_TIMEOUT, response.bytes()).await {
-            Ok(Ok(bytes)) => bytes.is_empty(),
+        match tokio::time::timeout(PROBE_TIMEOUT, response.chunk()).await {
+            // 读到数据 = 裸拉可用
+            Ok(Ok(Some(chunk))) => chunk.is_empty(),
+            // 直接 EOF：200 + 空 body，防盗链静默拒绝
+            Ok(Ok(None)) => true,
             _ => true,
         }
     }
