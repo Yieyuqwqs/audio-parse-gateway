@@ -1,94 +1,147 @@
 /**
- * @name 夜雨 · Rust 解析网关
- * @description 走本地 audio-parse-gateway（Termux 里的 Rust 服务）
- * @version 1.1.0
+ * @name 夜雨 · Rust 网关
+ * @description 走本机 audio-parse-gateway（Termux 里那个 Rust 服务）
+ * @version 2.0.0
  * @author 夜雨
  */
-const { EVENT_NAMES, request, on, send } = globalThis.lx
+var lx = globalThis.lx
+var EVENT_NAMES = lx.EVENT_NAMES
+var request = lx.request
+var on = lx.on
+var send = lx.send
 
-// 同一台手机：Termux 里网关默认监听 127.0.0.1:8080
-const BASE_URL = 'http://127.0.0.1:8080'
-const SUPPORTED_SOURCES = ['kw', 'kg', 'tx', 'wy', 'mg']
-const QUALITY_LIST = ['128k', '320k', 'flac', 'flac24bit']
+// ====== 只改这里就行 ======
+var BASE_URL = 'http://127.0.0.1:8080'   // 网关地址
+var TIMEOUT_MS = 10000                   // 客户端兜底超时
+// ==========================
 
-// 网关只起了 mock 上游时会返回这个域名——那种直链是假的，直接报清楚，别让播放器瞎试
-const isMockUrl = (url) => typeof url === 'string' && url.includes('lx-mock.example')
+var SOURCES = ['tx', 'wy', 'kw', 'kg', 'mg']
 
-const fetchMusicUrl = (params) => new Promise((resolve, reject) => {
-  const { src, mid, quality, name, singer } = params
-  const qs = new URLSearchParams({ quality })
-  if (name) qs.set('name', name)
-  if (singer) qs.set('singer', singer)
-  // 带上 fallback=1：主源（比如 tx）彻底失败时，让网关拿歌名去网易云二次搜索
-  if (name) qs.set('fallback', '1')
-
-  const url = `${BASE_URL}/url/${src}/${encodeURIComponent(mid)}?${qs.toString()}`
-  request(url, {}, (err, resp) => {
-    if (err) return reject(new Error(`网关不可达：${err.message}`))
-
-    let body
-    try {
-      body = JSON.parse(resp.body)
-    } catch (e) {
-      return reject(new Error(`网关返回的不是 JSON（HTTP ${resp.statusCode}）`))
-    }
-
-    if (body.code !== 0) return reject(new Error(body.msg || `code=${body.code}`))
-
-    const data = body.data || {}
-    if (!data.url) return reject(new Error('响应里没有 url'))
-    if (data.mock === true || isMockUrl(data.url)) {
-      return reject(new Error('网关只有 mock 上游：请检查 Termux 里 ~/audio-parse-gateway/.env（ENABLE_QQ / ENABLE_NETEASE）并重启'))
-    }
-    resolve(data.url)
-  })
-})
-
-// 从 LX 的 musicInfo 里挑出各平台对应的 id
-const pickMid = (info, src) => {
-  if (!info) return undefined
-  if (src === 'tx') return info.songmid || info.strMediaMid
-  if (src === 'kg') return info.hash
-  if (src === 'kw') return info.rid || info.id
-  if (src === 'wy') return info.id
-  if (src === 'mg') return info.copyrightId
-  return info.songmid || info.hash || info.strMediaMid || info.copyrightId || info.id
+// 每个平台声明的音质：上限写真实能力，别乱吹（吹了 LX 会一直请求拿不到的档）
+// tx：账号权益决定能到哪一档，网关会如实降档并返回能用的链接
+var QUALITYS = {
+  tx: ['128k', '320k', 'flac', 'flac24bit'],
+  wy: ['128k', '320k', 'flac', 'flac24bit'],
+  kw: ['128k', '320k', 'flac'],
+  kg: ['128k', '320k', 'flac'],
+  mg: ['128k', '320k', 'flac24bit'],
 }
 
-const actions = SUPPORTED_SOURCES.reduce((acc, src) => {
-  acc[src] = {
-    musicUrl(info, quality) {
-      const mid = pickMid(info, src)
-      if (!mid) return Promise.reject(new Error(`${src}: 拿不到歌曲 id`))
-      return fetchMusicUrl({
-        src,
-        mid,
-        quality,
-        name: info.name,
-        singer: typeof info.singer === 'string' ? info.singer : (info.singer || []).map?.((s) => s.name).join(' '),
-      })
-    },
+// 各平台的 id 字段不一样，按优先级挑第一个非空的
+function pickMid(source, info) {
+  if (!info) return ''
+  var bySource = {
+    tx: [info.songmid, info.strMediaMid],
+    wy: [info.id, info.songmid],
+    kw: [info.rid, info.id],
+    kg: [info.hash, info.songmid],
+    mg: [info.copyrightId, info.id],
   }
-  return acc
-}, {})
+  var list = bySource[source] || [
+    info.songmid, info.hash, info.strMediaMid, info.copyrightId, info.id, info.rid,
+  ]
+  for (var i = 0; i < list.length; i++) {
+    var v = list[i]
+    if (v !== undefined && v !== null && String(v).trim() !== '') return String(v).trim()
+  }
+  return ''
+}
 
-on(EVENT_NAMES.request, ({ source, action, info }) => {
-  if (action !== 'musicUrl') return Promise.reject(new Error(`不支持的操作：${action}`))
-  const handler = actions[source]
-  if (!handler) return Promise.reject(new Error(`不支持的平台：${source}`))
-  return handler.musicUrl(info.musicInfo, info.type)
+function singerOf(info) {
+  if (!info || !info.singer) return ''
+  var s = info.singer
+  if (typeof s === 'string') return s
+  if (Object.prototype.toString.call(s) === '[object Array]') {
+    var names = []
+    for (var i = 0; i < s.length; i++) {
+      if (s[i] && s[i].name) names.push(s[i].name)
+    }
+    return names.join(' ')
+  }
+  return ''
+}
+
+// 统一请求网关：解析 JSON、判 code、拦 mock 假直链
+function fetchGateway(url) {
+  return new Promise(function (resolve, reject) {
+    var settled = false
+    var timer = null
+    if (typeof setTimeout === 'function') {
+      timer = setTimeout(function () {
+        if (settled) return
+        settled = true
+        reject(new Error('网关超时（' + TIMEOUT_MS + 'ms）'))
+      }, TIMEOUT_MS)
+    }
+
+    request(url, {}, function (err, resp) {
+      if (settled) return
+      settled = true
+      if (timer) clearTimeout(timer)
+
+      if (err) return reject(new Error('网关不可达：' + err.message))
+
+      var body
+      try {
+        body = JSON.parse(resp.body)
+      } catch (e) {
+        return reject(new Error('网关返回的不是 JSON（HTTP ' + resp.statusCode + '）'))
+      }
+      if (!body || body.code !== 0) {
+        return reject(new Error((body && body.msg) || ('解析失败 code=' + (body && body.code))))
+      }
+
+      var data = body.data || {}
+      if (!data.url) return reject(new Error('响应里没有 url'))
+      // 网关只有 mock 上游时会给假地址，直接说清楚，别让播放器瞎试
+      if (data.mock === true || String(data.url).indexOf('lx-mock.example') >= 0) {
+        return reject(new Error('网关只有 mock 上游：检查 Termux 里 ~/audio-parse-gateway/.env 的 ENABLE_QQ / ENABLE_NETEASE'))
+      }
+      resolve(data)
+    })
+  })
+}
+
+function musicUrl(source, info, quality) {
+  var mid = pickMid(source, info)
+  if (!mid) return Promise.reject(new Error(source + ': 缺少歌曲 id'))
+
+  var params = ['quality=' + encodeURIComponent(quality)]
+  var name = (info && info.name) || ''
+  if (name) {
+    // 带上歌名/歌手 + fallback=1：主源彻底失败时，网关会拿关键词去网易云二次搜索
+    params.push('name=' + encodeURIComponent(name))
+    var singer = singerOf(info)
+    if (singer) params.push('singer=' + encodeURIComponent(singer))
+    params.push('fallback=1')
+  }
+
+  var url = BASE_URL + '/url/' + source + '/' + encodeURIComponent(mid) + '?' + params.join('&')
+  return fetchGateway(url).then(function (data) {
+    return data.url
+  })
+}
+
+on(EVENT_NAMES.request, function (payload) {
+  if (!payload || payload.action !== 'musicUrl') {
+    return Promise.reject(new Error('不支持的操作：' + (payload && payload.action)))
+  }
+  var info = payload.info || {}
+  if (SOURCES.indexOf(payload.source) < 0) {
+    return Promise.reject(new Error('不支持的源：' + payload.source))
+  }
+  return musicUrl(payload.source, info.musicInfo, info.type)
 })
 
-send(EVENT_NAMES.inited, {
-  sources: Object.fromEntries(
-    SUPPORTED_SOURCES.map((src) => [
-      src,
-      {
-        name: `夜雨-${src}`,
-        type: 'music',
-        actions: ['musicUrl'],
-        qualitys: QUALITY_LIST,
-      },
-    ])
-  ),
-})
+var sources = {}
+for (var i = 0; i < SOURCES.length; i++) {
+  var s = SOURCES[i]
+  sources[s] = {
+    name: '夜雨-' + s,
+    type: 'music',
+    actions: ['musicUrl'],
+    qualitys: QUALITYS[s],
+  }
+}
+
+send(EVENT_NAMES.inited, { sources: sources })
