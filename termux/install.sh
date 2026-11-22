@@ -38,6 +38,8 @@ else
 fi
 
 chmod +x "$BIN"
+cp "${SELF_DIR}/check.sh" "${APP_DIR}/check.sh" 2>/dev/null || true
+[ -f "${APP_DIR}/check.sh" ] && chmod +x "${APP_DIR}/check.sh"
 say "二进制：$(ls -lh "$BIN" | awk '{print $5}')"
 
 # ---------- 凭据 ----------

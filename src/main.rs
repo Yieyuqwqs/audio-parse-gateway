@@ -763,6 +763,18 @@ async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 /// 启动自检用的一首样曲（`kg` 需要真实 hash，拿不到就跳过）
+/// 代拉短链的对外 base：`PUBLIC_BASE_URL` 优先，否则按 BIND_ADDR 推导（0.0.0.0 用 127.0.0.1）。
+fn public_base() -> String {
+    if let Ok(base) = std::env::var("PUBLIC_BASE_URL") {
+        if !base.trim().is_empty() {
+            return base.trim().trim_end_matches('/').to_string();
+        }
+    }
+    let bind = std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
+    let port = bind.rsplit(':').next().unwrap_or("8080").to_string();
+    format!("http://127.0.0.1:{port}")
+}
+
 fn sample_id(source: &str) -> Option<&'static str> {
     match source {
         "tx" => Some("002lzYCa14usQ5"),
@@ -1000,7 +1012,7 @@ async fn main() -> Result<(), BoxError> {
         flight: Arc::new(SingleFlight::default()),
         limiter: Arc::new(Semaphore::new(UPSTREAM_MAX_INFLIGHT)),
         stats: Arc::new(Stats::default()),
-        proxy: Arc::new(proxy::ProxyStore::new()),
+        proxy: Arc::new(proxy::ProxyStore::new(public_base())),
     };
 
     // 启动自检：tx/kg/kw/wy/mg 五平台的适配器矩阵（STARTUP_PROBE=1 时再并发真打一发）
@@ -1021,9 +1033,8 @@ async fn main() -> Result<(), BoxError> {
         .route("/stream/{token}", get(proxy::stream_handler))
         .with_state(state);
 
-    let addr: SocketAddr = std::env::var("BIND_ADDR")
-        .unwrap_or_else(|_| "0.0.0.0:8080".to_string())
-        .parse()?;
+    let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
+    let addr: SocketAddr = bind_addr.parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
 
     info!("LX parse gateway listening on http://{addr}");
@@ -1201,7 +1212,7 @@ mod tests {
             flight: Arc::new(SingleFlight::default()),
             limiter: Arc::new(Semaphore::new(64)),
             stats: Arc::new(Stats::default()),
-            proxy: Arc::new(proxy::ProxyStore::new()),
+            proxy: Arc::new(proxy::ProxyStore::new("http://127.0.0.1:8080".to_string())),
         }
     }
 

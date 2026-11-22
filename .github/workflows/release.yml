@@ -120,7 +120,7 @@ jobs:
           cp README.md "dist/${NAME}/"
           if [ "${{ matrix.android }}" = "true" ]; then
             # Termux 用户直接拷走就能用
-            cp termux/install.sh "dist/${NAME}/" 2>/dev/null || true
+            cp termux/install.sh termux/check.sh "dist/${NAME}/" 2>/dev/null || true
           fi
           tar -C dist -czf "dist/${NAME}.tar.gz" "${NAME}"
           (
