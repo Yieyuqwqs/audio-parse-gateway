@@ -285,7 +285,9 @@ mod tests {
     /// 黄金用例：签名算法（参数排序 + 盐 + 裸拼接）一旦改坏，酷狗会直接 400
     #[test]
     fn signature_matches_the_reference_implementation() {
-        let query = KgUpstream::signed_query(HASH, "320", 1_795_339_200);
+        // 注意传的是网关内部的档位名（320k），映射成酷狗的 quality=320 是 quality_for 的事
+        let query = KgUpstream::signed_query(HASH, "320k", 1_795_339_200);
+        assert!(query.contains("quality=320&"), "quality 没映射成 320：{query}");
         assert!(
             query.contains("key=0cbb4cc72dea54761190cb20872e433b"),
             "key 应该是 md5(hash + 后缀)：{query}"
