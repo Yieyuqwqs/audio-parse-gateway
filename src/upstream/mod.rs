@@ -22,6 +22,7 @@ pub mod mock;
 pub mod netease;
 pub mod node;
 pub mod qq;
+pub mod search;
 
 pub use kugou::KgUpstream;
 pub use kuwo::KwUpstream;

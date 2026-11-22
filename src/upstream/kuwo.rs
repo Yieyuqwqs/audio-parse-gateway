@@ -138,6 +138,11 @@ impl Upstream for KwUpstream {
         }
     }
 
+    /// 关键词搜索：主源拿不到时按歌名换源用
+    async fn search_keyword(&self, keyword: &str) -> Result<String, UpstreamError> {
+        crate::upstream::search::kuwo(crate::http::client(), keyword, self.timeout).await
+    }
+
     async fn resolve(&self, req: &TrackRequest) -> Result<SourceUrl, UpstreamError> {
         let rid = req.music_id.trim();
         // 酷我的 rid 是纯数字；拿 kg 的 hash 或 tx 的 songmid 打过来要早点挡掉

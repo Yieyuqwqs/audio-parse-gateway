@@ -147,6 +147,11 @@ impl Upstream for MiguUpstream {
         }
     }
 
+    /// 关键词搜索：主源拿不到时按歌名换源用
+    async fn search_keyword(&self, keyword: &str) -> Result<String, UpstreamError> {
+        crate::upstream::search::migu(crate::http::client(), keyword, self.timeout).await
+    }
+
     async fn resolve(&self, req: &TrackRequest) -> Result<SourceUrl, UpstreamError> {
         let (copyright_id, content_id) = split_ids(&self.name, &req.music_id)?;
         let url = self.request_url(&copyright_id, &content_id, req.quality);
