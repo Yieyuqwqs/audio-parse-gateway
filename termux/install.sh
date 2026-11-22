@@ -87,6 +87,15 @@ fi
 
 export BIND_ADDR="${BIND_ADDR:-127.0.0.1:8080}"
 
+# 启动前把关键环境变量打出来（凭据只显示长度），排查「为什么全是 mock」一眼就能看到
+if [ -f ./env.sh ]; then
+  printf '\033[36m[run]\033[0m env.sh 已加载\n'
+else
+  printf '\033[33m[run]\033[0m 没有 env.sh（凭据未加载）\n'
+fi
+printf '\033[36m[run]\033[0m env: ENABLE_QQ=%s ENABLE_NETEASE=%s TX_UIN=%s TX_COOKIE=%s NETEASE_COOKIE=%s\n' \
+  "${ENABLE_QQ:-unset}" "${ENABLE_NETEASE:-unset}" "${TX_UIN:-unset}" \
+  "${TX_COOKIE:+set(${#TX_COOKIE}chars)}" "${NETEASE_COOKIE:+set}"
 if [ -z "${ENABLE_QQ:-}${ENABLE_NETEASE:-}${UPSTREAM_A_URL:-}" ]; then
   printf '\033[33m[run]\033[0m 警告：没有检测到真实上游（ENABLE_QQ / ENABLE_NETEASE / UPSTREAM_A_URL 都为空）\n'
   printf '\033[33m[run]\033[0m       现在只会返回 mock 假直链，播放器一定「换源失败」\n'

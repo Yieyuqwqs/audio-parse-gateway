@@ -443,10 +443,12 @@ flac24bit → flac → 320k → 128k
 
 有些平台的直链不认客户端裸请求（403）。现在的处理：
 
-1. 解析成功后，对 `AUTO_PROXY`（默认 `tx`）里的平台做一次带 `Referer` 的 `Range: bytes=0-0` HEAD 探测；
-2. 探测到 `401/403/405` → 把直链换成网关短链 `/stream/{token}`；
+1. 对 `AUTO_PROXY`（默认 `tx`）里的平台，**无条件**把直链换成网关短链 `/stream/{token}`；
+2. 不再做「探测」—— 实测腾讯 CDN 是**按 User-Agent** 挡的：浏览器 UA 裸拉 200+3MB 正常，
+   播放器 UA 就回 200 但 0 字节。任何探测都会得出错误结论，不如直接代拉；
 3. 客户端拉 `/stream/{token}` 时，网关补齐 `Referer`（`https://y.qq.com/` 等）+ `User-Agent`，把音频流原样转发；
-4. token 只存进程内、10 分钟过期，不落盘；探测失败（超时/网络错）一律按「不需要代拉」处理，宁可直接给直链。
+4. token 只存进程内、10 分钟过期，不落盘；代拉走的是**没有总超时**的 streaming client，
+   否则 800ms 的 BODY_DEADLINE 会把 3~10MB 的音频流砍断；
 
 `AUTO_PROXY=` （空）可关掉代拉；`AUTO_PROXY=tx,wy` 可扩展。
 

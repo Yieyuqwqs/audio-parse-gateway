@@ -56,6 +56,27 @@ pub(crate) fn client() -> &'static reqwest::Client {
     &CLIENT
 }
 
+/// 流式转发专用客户端：**没有总超时**。
+///
+/// 普通客户端的 `BODY_DEADLINE` 是 800ms，对「代拉一个 3~10MB 的音频流」是致命的
+/// （传到一半就被砍）。这里只保留建连超时，读 body 交给客户端自己的节奏。
+static STREAM_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
+    reqwest::Client::builder()
+        .pool_max_idle_per_host(POOL_MAX_IDLE_PER_HOST)
+        .pool_idle_timeout(POOL_IDLE_TIMEOUT)
+        .tcp_keepalive(TCP_KEEPALIVE)
+        .tcp_nodelay(true)
+        .connect_timeout(CONNECT_TIMEOUT)
+        .user_agent(concat!("lx-parse-gateway/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .expect("failed to build the streaming client")
+});
+
+/// 取流式客户端（给 `/stream/{token}` 用）
+pub(crate) fn streaming_client() -> &'static reqwest::Client {
+    &STREAM_CLIENT
+}
+
 /// 启动期预热：让配置错误在启动时炸出来，而不是等第一个请求。
 pub(crate) fn warm_up() {
     Lazy::force(&CLIENT);

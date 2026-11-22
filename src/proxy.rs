@@ -86,45 +86,6 @@ impl ProxyStore {
     pub(crate) fn len(&self) -> usize {
         self.targets.len()
     }
-
-    /// 直链是否需要网关代拉。
-    ///
-    /// 探测姿势必须是「**不带 Referer**、像播放器那样真拉 2 字节」：
-    ///
-    /// * 腾讯 CDN 的坑：裸请求会返回 **200 但 body 为空**（不是 403），只看状态码会把「放不了」
-    ///   误判成「能播」——之前就是这么踩的；
-    /// * 任何 4xx/5xx、空 body、超时、网络错，都认为裸拉不可用 → 交给网关代拉（代拉会补 Referer）。
-    pub(crate) async fn needs_proxy(url: &str, referer: &str) -> bool {
-        if referer.is_empty() {
-            return false;
-        }
-        let Ok(parsed) = reqwest::Url::parse(url) else {
-            return false;
-        };
-
-        // 关键：**不能带 Range**。腾讯 CDN 对「带 Range 的裸请求」会正常回 206 + 2 字节，
-        // 但播放器发的是普通 GET，同样裸请求会被挡成 200 + 0 字节（2026-11-22 实测）。
-        // 所以这里必须完全模拟播放器：普通 GET，只读第一个 chunk 就断开。
-        let request = crate::http::client()
-            .get(parsed)
-            .header(reqwest::header::USER_AGENT, USER_AGENT);
-
-        let Ok(Ok(mut response)) = tokio::time::timeout(PROBE_TIMEOUT, request.send()).await else {
-            return true; // 连探测都失败：直接代拉，别赌
-        };
-
-        if !response.status().is_success() {
-            return true;
-        }
-
-        match tokio::time::timeout(PROBE_TIMEOUT, response.chunk()).await {
-            // 读到数据 = 裸拉可用
-            Ok(Ok(Some(chunk))) => chunk.is_empty(),
-            // 直接 EOF：200 + 空 body，防盗链静默拒绝
-            Ok(Ok(None)) => true,
-            _ => true,
-        }
-    }
 }
 
 /// `GET /stream/{token}`：补齐 Referer/UA 之后把音频流原样转发
@@ -136,7 +97,8 @@ pub(crate) async fn stream_handler(
         return (StatusCode::NOT_FOUND, "stream token expired").into_response();
     };
 
-    let response = crate::http::client()
+    // 注意用 streaming_client：普通客户端有 800ms 总超时，会把音频流砍断
+    let response = crate::http::streaming_client()
         .get(url.as_str())
         .header(reqwest::header::REFERER, referer)
         .header(reqwest::header::USER_AGENT, USER_AGENT)
@@ -200,46 +162,5 @@ mod tests {
     fn empty_referer_never_proxies() {
         let store = ProxyStore::new("http://127.0.0.1:8080".to_string());
         assert!(store.len() == 0);
-    }
-
-    #[tokio::test]
-    async fn detects_403_and_passes_200() {
-        use axum::{routing::get, Router};
-
-        // 永远 403：应该判定需要代拉
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let addr = listener.local_addr().expect("addr");
-        tokio::spawn(async move {
-            let app = Router::new().route("/forbidden", get(|| async { StatusCode::FORBIDDEN }));
-            let _ = axum::serve(listener, app).await;
-        });
-        assert!(
-            ProxyStore::needs_proxy(&format!("http://{addr}/forbidden"), "https://y.qq.com/").await,
-            "403 必须判定为需要代拉"
-        );
-
-        // 200 且真有字节：不需要代拉
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let addr = listener.local_addr().expect("addr");
-        tokio::spawn(async move {
-            let app = Router::new().route("/ok", get(|| async { vec![0u8, 1u8] }));
-            let _ = axum::serve(listener, app).await;
-        });
-        assert!(
-            !ProxyStore::needs_proxy(&format!("http://{addr}/ok"), "https://y.qq.com/").await,
-            "200 且有字节不该走代理"
-        );
-
-        // 200 但空 body（腾讯 CDN 的防盗链姿势）：必须判定需要代拉
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let addr = listener.local_addr().expect("addr");
-        tokio::spawn(async move {
-            let app = Router::new().route("/empty", get(|| async { "" }));
-            let _ = axum::serve(listener, app).await;
-        });
-        assert!(
-            ProxyStore::needs_proxy(&format!("http://{addr}/empty"), "https://y.qq.com/").await,
-            "200 空 body 必须判定为需要代拉"
-        );
     }
 }

@@ -505,13 +505,11 @@ impl AppState {
             url.quality = candidate.to_string();
         }
 
-        // 防盗链：有些平台的直链不认客户端裸请求（403）。
-        // 探测到 401/403/405 就换成网关代拉的短链，代拉时会补齐 Referer。
+        // 防盗链：QQ 这类 CDN 是按 **User-Agent** 挡的（播放器 UA 会拿到 200 + 0 字节），
+        // 所以不做探测、对 AUTO_PROXY 平台无条件换成网关代拉地址（代拉会带浏览器 UA + Referer）。
         if self.should_proxy(source) {
             let referer = upstream::referer_for(source);
-            if proxy::ProxyStore::needs_proxy(&url.url, referer).await {
-                url.url = self.proxy.link(url.url.clone(), referer.to_string());
-            }
+            url.url = self.proxy.link(url.url.clone(), referer.to_string());
         }
 
         self.stats.upstream_hits.fetch_add(1, Ordering::Relaxed);
