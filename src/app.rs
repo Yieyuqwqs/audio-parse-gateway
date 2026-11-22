@@ -52,6 +52,7 @@ mod http;
 mod logfmt;
 mod metrics;
 mod proxy;
+mod lxsp;
 mod quality;
 mod upstream;
 
@@ -1148,6 +1149,10 @@ async fn main() -> Result<(), BoxError> {
         .route("/api/parse", get(parse_handler))
         .route("/url/{source}/{music_id}", get(lx_url_handler))
         .route("/health", get(health_handler))
+        // LXSP v2：同一套解析设施的第二张皮（老接口一行不动）
+        .route("/manifest", get(lxsp::manifest))
+        .route("/lxsp/url/{source}/{music_id}", get(lxsp::url))
+        .route("/healthz", get(lxsp::healthz))
         .route("/metrics", get(metrics_handler))
         // 防盗链代拉：/stream/{token} 会补齐 Referer 再把音频流吐回去
         .route("/stream/{token}", get(proxy::stream_handler))
