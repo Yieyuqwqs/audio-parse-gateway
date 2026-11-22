@@ -5,6 +5,12 @@ edition = "2021"
 rust-version = "1.88"
 description = "落雪音乐（LX Music）解析后端骨架：高并发、低延迟、多级缓存、singleflight 防击穿"
 license = "MIT"
+autobins = false
+
+
+[[bin]]
+name = "audio-parse-gateway"
+path = "src/app.rs"
 
 [dependencies]
 # ---------- Web / 异步运行时 ----------

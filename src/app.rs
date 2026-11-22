@@ -548,23 +548,65 @@ impl AppState {
     /// 跨平台回退：主源彻底失败时，拿关键词去网易云搜一次再解析。
     ///
     /// 目前只有网易云实现了真实搜索（kw/kg 的搜索接口都要反爬会话，见 README）。
+    /// 跨平台回退：主源彻底失败时，拿歌名（或 keyword）去**每家并发搜一次**，谁先给出可播 id 用谁。
+    ///
+    /// 零 CK 的现实是：热门原曲在四家的免费库常常只有某一档能拿，甚至只有 Live/DJ 版。
+    /// 所以这里不再只问网易云，而是 kg / kw / mg / wy 一起问。
     async fn cross_source(
         &self,
         keyword: &str,
         quality: &'static str,
     ) -> Result<Resolved, AppError> {
-        let searcher = self
-            .upstreams
-            .iter()
-            .find(|upstream| upstream.name() == "netease")
-            .cloned()
-            .ok_or_else(|| {
-                AppError::Upstream("cross-source fallback needs the netease adapter".to_string())
-            })?;
+        const ORDER: [&str; 4] = ["kg", "kw", "mg", "wy"];
 
-        let song_id = searcher.search_keyword(keyword).await.map_err(AppError::from)?;
-        debug!(search = keyword, song_id = %song_id, "cross-source fallback matched a track");
-        self.resolve("wy", &song_id, quality).await
+        let mut searchers: Vec<(&'static str, Arc<dyn Upstream>)> = Vec::new();
+        for source in ORDER {
+            if let Some(searcher) = self
+                .upstreams
+                .iter()
+                .find(|upstream| upstream.supports(source))
+                .cloned()
+            {
+                searchers.push((source, searcher));
+            }
+        }
+        if searchers.is_empty() {
+            return Err(AppError::Upstream(
+                "cross-source fallback needs at least one searchable adapter".to_string(),
+            ));
+        }
+
+        // 搜到 id 就立刻开始解析：用 futures 的 join_all 语义手写一个「先成功先用」
+        let mut tasks = tokio::task::JoinSet::new();
+        for (source, searcher) in searchers {
+            let keyword = keyword.to_string();
+            tasks.spawn(async move {
+                let id = searcher.search_keyword(&keyword).await.map_err(AppError::from)?;
+                Ok::<(&'static str, String), AppError>((source, id))
+            });
+        }
+
+        let mut matched: Vec<(&'static str, String)> = Vec::new();
+        while let Some(joined) = tasks.join_next().await {
+            match joined {
+                Ok(Ok(pair)) => matched.push(pair),
+                Ok(Err(err)) => debug!(error = %err, "a search adapter found nothing"),
+                Err(err) => debug!(error = %err, "search task failed"),
+            }
+        }
+
+        let mut last_error: Option<AppError> = None;
+        for (source, song_id) in matched {
+            debug!(search = keyword, source, song_id = %song_id, "cross-source fallback matched a track");
+            match self.resolve(source, &song_id, quality).await {
+                Ok(resolved) => return Ok(resolved),
+                Err(err) => last_error = Some(err),
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| {
+            AppError::Upstream(format!("no cross-source match for `{keyword}`"))
+        }))
     }
 
     /// 多平台混音：主源失败时依次拿同一个 id 去零凭据平台试。
@@ -1813,4 +1855,54 @@ mod tests {
     }
 }
 
-/// 组装 LX 响应包（出口改写 → 指标 → 访问日志）
+async fn finish(
+    state: &AppState,
+    client_base: String,
+    resolved: Resolved,
+    music_id: &str,
+    quality: &'static str,
+    started: Instant,
+) -> Result<Json<OkBody>, AppError> {
+    let downgraded = resolved.downgraded();
+    if downgraded {
+        state.stats.downgraded.fetch_add(1, Ordering::Relaxed);
+    }
+
+    // 直链是不是 mock 造的假地址（给客户端一个明确信号，别让它傻试）
+    let mock = state
+        .upstreams
+        .iter()
+        .any(|upstream| upstream.is_mock() && upstream.name() == resolved.url.provider.as_str());
+
+    // ---- 出口改写：缓存里是上游原链，这里才决定给客户端原链还是 /stream 代拉 ----
+    let upstream_url = resolved.url.url.clone();
+    let proxied = state.should_proxy(resolved.source);
+    let play_url = if proxied {
+        let referer = upstream::referer_for(resolved.source).to_string();
+        state
+            .proxy
+            .link_with_base(client_base.as_str(), upstream_url.clone(), referer)
+    } else {
+        upstream_url.clone()
+    };
+
+    access_log(200, resolved.source, music_id, &resolved.url.quality, started);
+    debug!(proxied, upstream = %upstream_url, play = %play_url, "resolved for the client");
+
+    Ok(Json(OkBody {
+        code: 0,
+        msg: "success",
+        data: TrackData {
+            url: play_url,
+            source: resolved.source.to_string(),
+            quality: resolved.url.quality.clone(),
+            requested_quality: quality.to_string(),
+            downgraded,
+            mock,
+            provider: resolved.url.provider,
+            cache: resolved.layer,
+            coalesced: resolved.coalesced,
+            elapsed_ms: started.elapsed().as_millis() as u64,
+        },
+    }))
+}
