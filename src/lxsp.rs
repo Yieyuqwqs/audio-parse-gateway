@@ -52,7 +52,9 @@ pub(crate) struct UrlQuery {
 /// LXSP 的词汇更大（master / atmos / wav / 192k …），出口映射一次即可，别让每个调用点各写一套。
 fn map_quality(raw: Option<&str>) -> Result<&'static str, AppError> {
     let value = raw.map(str::trim).filter(|v| !v.is_empty()).unwrap_or("auto");
-    let canonical: &str = match value.to_ascii_lowercase().as_str() {
+    // 先落一个 String，否则 match 会借用临时值（E0716）
+    let lowered = value.to_ascii_lowercase();
+    let canonical: &str = match lowered.as_str() {
         "auto" => return quality::normalize(None),
         "master" | "atmos" | "atmos_plus" | "hires" => "flac24bit",
         "wav" | "ape" => "flac",
